@@ -477,7 +477,7 @@ impl Model {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(cfg.head_dim(), device, None)?)
                 }
@@ -514,17 +514,23 @@ impl Model {
                 None,
             ))?
         };
+        let cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.sliding_window,
+            cfg.head_dim(),
+            cfg.num_key_value_heads,
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                cfg.sliding_window,
-            )),
+            cache,
             max_seq_len: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             cfg: ModelConfigMetadata {

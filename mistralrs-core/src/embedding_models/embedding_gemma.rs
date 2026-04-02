@@ -392,7 +392,7 @@ impl EmbeddingGemma {
             );
         }
 
-        if !matches!(attention_mechanism, AttentionImplementation::Eager) {
+        if !matches!(attention_mechanism, AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_)) {
             candle_core::bail!("Expected AttentionImplementation::Eager");
         }
 

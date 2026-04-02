@@ -3593,6 +3593,7 @@ dependencies = [
  "tqdm",
  "tracing",
  "tracing-subscriber",
+ "turboquant",
  "urlencoding",
  "utoipa",
  "uuid 1.19.0",
@@ -6848,6 +6849,14 @@ dependencies = [
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
+]
+
+[[package]]
+name = "turboquant"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1101,6 +1101,16 @@ fn init_cache_config(
     cache_type: PagedCacheType,
     no_paged_attn: bool,
 ) -> Result<Option<PagedAttentionConfig>> {
+    // TurboQuant works on any device (including CPU) and doesn't need
+    // GPU memory allocation. Create a minimal config and return early.
+    if cache_type.is_turboquant() {
+        return Ok(Some(PagedAttentionConfig::new(
+            paged_attn_block_size,
+            MemoryGpuConfig::ContextSize(0), // Not used for TurboQuant
+            cache_type,
+        )?));
+    }
+
     match (
         paged_attn_block_size,
         paged_attn_gpu_mem,

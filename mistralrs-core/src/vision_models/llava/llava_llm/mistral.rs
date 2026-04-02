@@ -490,7 +490,7 @@ impl Model {
                 device,
             )?;
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }

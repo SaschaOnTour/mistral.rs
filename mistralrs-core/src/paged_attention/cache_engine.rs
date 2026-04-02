@@ -9,18 +9,35 @@ use serde::{Deserialize, Serialize};
 use super::config::{KvCacheLayout, ModelConfigLike};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
-#[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq))]
 pub enum PagedCacheType {
     #[default]
     Auto,
     F8E4M3,
+    /// TurboQuant KV-cache quantization with the given total bit budget.
+    /// Typical values: 3 (2-bit PolarQuant + 1-bit QJL) or 4 (3-bit + 1-bit).
+    TurboQuant(u8),
 }
 
 impl PagedCacheType {
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
             PagedCacheType::F8E4M3 => DType::F8E4M3,
-            PagedCacheType::Auto => act_dtype,
+            // TurboQuant uses a separate quantized storage path, not Candle dtypes.
+            PagedCacheType::Auto | PagedCacheType::TurboQuant(_) => act_dtype,
+        }
+    }
+
+    /// Returns `true` if this cache type uses TurboQuant quantization.
+    pub fn is_turboquant(&self) -> bool {
+        matches!(self, PagedCacheType::TurboQuant(_))
+    }
+
+    /// Returns the TurboQuant bit width, or `None` for non-TQ types.
+    pub fn tq_bits(&self) -> Option<u8> {
+        match self {
+            PagedCacheType::TurboQuant(bits) => Some(*bits),
+            _ => None,
         }
     }
 }
@@ -31,8 +48,10 @@ impl FromStr for PagedCacheType {
         match s {
             "auto" => Ok(Self::Auto),
             "f8e4m3" => Ok(Self::F8E4M3),
+            "tq3" => Ok(Self::TurboQuant(3)),
+            "tq4" => Ok(Self::TurboQuant(4)),
             other => Err(format!(
-                "Unexpected `PagedCacheType`, got `{other}` but expected `auto` and `f8e4m3`."
+                "Unexpected `PagedCacheType`, got `{other}` but expected `auto`, `f8e4m3`, `tq3`, or `tq4`."
             )),
         }
     }
@@ -320,5 +339,69 @@ impl CacheEngine {
             model_config.v_head_dim(),
             block_size,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_auto() {
+        assert_eq!("auto".parse::<PagedCacheType>().unwrap(), PagedCacheType::Auto);
+    }
+
+    #[test]
+    fn parse_f8e4m3() {
+        assert_eq!("f8e4m3".parse::<PagedCacheType>().unwrap(), PagedCacheType::F8E4M3);
+    }
+
+    #[test]
+    fn parse_tq3() {
+        assert_eq!("tq3".parse::<PagedCacheType>().unwrap(), PagedCacheType::TurboQuant(3));
+    }
+
+    #[test]
+    fn parse_tq4() {
+        assert_eq!("tq4".parse::<PagedCacheType>().unwrap(), PagedCacheType::TurboQuant(4));
+    }
+
+    #[test]
+    fn parse_unknown_fails() {
+        assert!("tq5".parse::<PagedCacheType>().is_err());
+        assert!("fp16".parse::<PagedCacheType>().is_err());
+    }
+
+    #[test]
+    fn is_turboquant_detects_tq() {
+        assert!(PagedCacheType::TurboQuant(3).is_turboquant());
+        assert!(PagedCacheType::TurboQuant(4).is_turboquant());
+        assert!(!PagedCacheType::Auto.is_turboquant());
+        assert!(!PagedCacheType::F8E4M3.is_turboquant());
+    }
+
+    #[test]
+    fn tq_bits_returns_correct_value() {
+        assert_eq!(PagedCacheType::TurboQuant(3).tq_bits(), Some(3));
+        assert_eq!(PagedCacheType::TurboQuant(4).tq_bits(), Some(4));
+        assert_eq!(PagedCacheType::Auto.tq_bits(), None);
+        assert_eq!(PagedCacheType::F8E4M3.tq_bits(), None);
+    }
+
+    #[test]
+    fn to_dtype_tq_returns_activation_dtype() {
+        let act = DType::F16;
+        assert_eq!(PagedCacheType::TurboQuant(3).to_dtype(act), DType::F16);
+        assert_eq!(PagedCacheType::TurboQuant(4).to_dtype(act), DType::F16);
+    }
+
+    #[test]
+    fn to_dtype_f8e4m3_returns_f8() {
+        assert_eq!(PagedCacheType::F8E4M3.to_dtype(DType::F16), DType::F8E4M3);
+    }
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(PagedCacheType::default(), PagedCacheType::Auto);
     }
 }

@@ -797,7 +797,7 @@ impl Glm4Moe {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => Some(
                     PagedAttention::new(head_dim, device, None)
                         .expect("Failed to create PagedAttention"),
@@ -817,15 +817,22 @@ impl Glm4Moe {
             )
         })?;
 
+        let cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            None,
+            cfg.head_dim(),
+            (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             lm_head,
             embed_tokens,
             norm,
             layers,
-            cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            cache,
             device: normal_loading_metadata.real_device.clone(),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {

@@ -447,7 +447,7 @@ impl Qwen3VLTextModel {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(cfg.head_dim, device, None)?)
                 }
@@ -491,9 +491,15 @@ impl Qwen3VLTextModel {
             norm,
             layers,
             lm_head,
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
+                None,
+                cfg.head_dim,
+                (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
             )),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {

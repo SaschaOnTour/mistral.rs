@@ -13,6 +13,8 @@ pub mod encoder_cache;
 pub mod kv_cache_manager;
 mod layers;
 mod scheduler;
+/// TurboQuant KV-cache: parallel quantized storage for TQ3/TQ4 cache types.
+pub mod turboquant_cache;
 pub const _PAD_SLOT_ID: i64 = -1;
 
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
@@ -55,6 +57,8 @@ impl PagedAttentionConfig {
 pub enum AttentionImplementation {
     Eager,
     PagedAttention,
+    /// TurboQuant KV-cache quantization with the given total bit budget (3 or 4).
+    TurboQuant(u8),
 }
 
 #[derive(Clone, Copy)]

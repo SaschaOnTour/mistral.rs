@@ -21,7 +21,9 @@ use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
-use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
+use crate::paged_attention::{
+    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType,
+};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
@@ -323,7 +325,10 @@ impl Loader for NormalLoader {
         let _progress_guard = ProgressScopeGuard::new(silent);
         let config = std::fs::read_to_string(paths.get_config_filename())?;
 
-        if !self.inner.supports_paged_attention(&config)? {
+        let is_tq_early = paged_attn_config
+            .as_ref()
+            .is_some_and(|c| c.cache_type.is_turboquant());
+        if !self.inner.supports_paged_attention(&config)? && !is_tq_early {
             paged_attn_config = None;
         }
 
@@ -501,7 +506,10 @@ impl Loader for NormalLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        if mapping_uses_cpu && paged_attn_config.is_some() {
+        let is_turboquant = paged_attn_config
+            .as_ref()
+            .is_some_and(|c| c.cache_type.is_turboquant());
+        if mapping_uses_cpu && paged_attn_config.is_some() && !is_turboquant {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
@@ -604,10 +612,20 @@ impl Loader for NormalLoader {
 
         let is_xlora = self.kind.is_adapted_and(|a| a.is_x_lora());
 
-        let attention_mechanism = if paged_attn_config.is_some() {
-            AttentionImplementation::PagedAttention
-        } else {
-            AttentionImplementation::Eager
+        let attention_mechanism = match paged_attn_config.as_ref().map(|c| c.cache_type) {
+            Some(PagedCacheType::TurboQuant(bits)) => {
+                let compression = match bits {
+                    3 => "~4.9x",
+                    4 => "~3.5x",
+                    _ => "~?x",
+                };
+                info!(
+                    "Using TurboQuant TQ{bits} KV cache quantization ({bits}-bit, {compression} compression vs FP16)"
+                );
+                AttentionImplementation::TurboQuant(bits)
+            }
+            Some(_) => AttentionImplementation::PagedAttention,
+            None => AttentionImplementation::Eager,
         };
 
         let multi_progress = Arc::new(new_multi_progress());
@@ -935,7 +953,11 @@ impl Loader for NormalLoader {
             paged_attn_config
         };
 
-        let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
+        let (cache_config, cache_engine) = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+            // TurboQuant: skip CacheEngine (no paged attention blocks needed).
+            // Models create TurboQuant KvCache directly via NormalCacheType::TurboQuant.
+            (None, None)
+        } else if let Some(paged_attn_config) = paged_attn_config {
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,
                 paged_attn_config.block_size,

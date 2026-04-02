@@ -123,6 +123,7 @@ impl PrefixCacheManagerV2 {
                 KvCache::Rotating { k, .. } => {
                     k.all_data().as_ref().expect("No KV cache data").device()
                 }
+                KvCache::TurboQuant { device, .. } => device,
             };
 
             if !matches!(cache_device, Device::Cpu) {
@@ -147,6 +148,7 @@ impl PrefixCacheManagerV2 {
                 KvCache::Rotating { k, .. } => {
                     k.all_data().as_ref().expect("No KV cache data").device()
                 }
+                KvCache::TurboQuant { device, .. } => device,
             };
 
             if !matches!(cache_device, Device::Cpu) {

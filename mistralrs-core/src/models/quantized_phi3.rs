@@ -300,7 +300,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 rms_eps,
             )?;
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
@@ -350,10 +350,15 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output,
             mapper: Some(mapper),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new_sliding(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 block_count,
                 context_window,
                 Some(context_window),
+                head_dim,
+                head_count_kv,
+                device.clone(),
+                candle_core::DType::F32,
             )),
             max_seq_len: context_window,
             dtype,

@@ -384,7 +384,7 @@ impl VoxtralModel {
         vb: ShardedVarBuilder,
         _is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
-        _attention_mechanism: AttentionImplementation,
+        attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
         let mapper = normal_loading_metadata.mapper;
 
@@ -506,10 +506,15 @@ impl VoxtralModel {
             output,
             encoder,
             adapter,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 cfg.n_layers,
                 cfg.model_max_length,
                 cfg.sliding_window,
+                cfg.head_dim,
+                cfg.n_kv_heads,
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
             )),
             device: normal_loading_metadata.real_device,
             max_seq_len: cfg.model_max_length,

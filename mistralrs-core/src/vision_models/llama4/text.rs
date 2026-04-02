@@ -612,7 +612,7 @@ impl TextModel {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
+                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
@@ -631,15 +631,22 @@ impl TextModel {
             )
         })?;
 
+        let kv_cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            None,
+            cfg.hidden_size / cfg.num_attention_heads,
+            (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             wte,
             blocks,
             ln_f,
             lm_head,
-            kv_cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            kv_cache,
             device: normal_loading_metadata.real_device,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
