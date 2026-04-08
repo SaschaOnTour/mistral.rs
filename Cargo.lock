@@ -3547,6 +3547,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "mistralrs-audio",
+ "mistralrs-kv-cache",
  "mistralrs-mcp",
  "mistralrs-paged-attn",
  "mistralrs-quant",
@@ -3599,6 +3600,13 @@ dependencies = [
  "uuid 1.19.0",
  "variantly",
  "vob",
+]
+
+[[package]]
+name = "mistralrs-kv-cache"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
 ]
 
 [[package]]
@@ -6855,7 +6863,11 @@ dependencies = [
 name = "turboquant-rs"
 version = "0.2.0"
 dependencies = [
+ "candle-core",
+ "cudaforge",
  "half",
+ "mistralrs-kv-cache",
+ "serde",
  "thiserror 2.0.18",
 ]
 

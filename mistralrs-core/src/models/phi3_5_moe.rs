@@ -14,7 +14,7 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         self, layer_norm, Activation, CausalMasker, MatMul, PhiRopeConfig, PhiRopeScalingConfig,
-        PhiRotaryEmbedding, Sdpa,
+        PhiRotaryEmbedding,
     },
     layers_masker::{masked_fill, PastKvLenCache},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -246,10 +246,7 @@ impl Attention {
                 }
             },
             _ => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
             }
         };
 

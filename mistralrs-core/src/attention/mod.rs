@@ -376,34 +376,35 @@ pub fn cached_attention(
     sdpa_params: &SdpaParams,
     flash_params: Option<&FlashParams>,
 ) -> Result<Tensor> {
-    // TurboQuant: blockwise decode on CUDA (saves VRAM), full-dequant on CPU/Metal
-    // (CPU/Metal have optimized flash attention that beats our generic online softmax)
+    // Compressed cache: prefill/decode via CompressedKVCache trait.
+    // The cache implementation decides internally: fused kernel vs dequant.
     let is_decode = k.dim(2)? == 1;
     if let KvCache::TurboQuant { cache, layer, .. } = kv_cache {
         let mut guard = cache
             .lock()
-            .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock: {e}")))?;
-        if is_decode && guard.is_decode_ready(*layer) && k.device().is_cuda() {
-            return guard.append_and_blockwise_attend(
-                *layer,
-                k,
-                v,
-                q,
-                sdpa_params.softmax_scale,
-                sdpa_params.n_kv_groups,
-            );
+            .map_err(|e| candle_core::Error::Msg(format!("Compressed cache lock: {e}")))?;
+
+        if is_decode {
+            let config = mistralrs_kv_cache::AttendConfig {
+                softmax_scale: sdpa_params.softmax_scale,
+                n_kv_groups: sdpa_params.n_kv_groups,
+            };
+            return match guard.decode(*layer, k, v, q, &config)? {
+                mistralrs_kv_cache::DecodeOutput::Fused(output) => Ok(output),
+                mistralrs_kv_cache::DecodeOutput::Dequantized(result) => {
+                    let sdpa_params = sdpa_params.with_qjl(result.logit_bias);
+                    Sdpa.run_attention(q, &result.k, &result.v, mask, flash_params, &sdpa_params)
+                }
+            };
         }
-        // CPU/Metal decode, prefill, or first token: full-dequant + SDPA
-        let (k_out, v_out) = guard.append_and_dequantize(*layer, k, v)?;
-        drop(guard); // release lock before qjl_bias (which re-locks)
-        let qjl_bias = kv_cache.qjl_bias(q)?;
-        let sdpa_params = sdpa_params.with_qjl(qjl_bias);
-        return Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, &sdpa_params);
+
+        // Prefill: multiple tokens
+        let result = guard.prefill(*layer, k, v, q)?;
+        let sdpa_params = sdpa_params.with_qjl(result.logit_bias);
+        return Sdpa.run_attention(q, &result.k, &result.v, mask, flash_params, &sdpa_params);
     }
 
     // Normal / Rotating cache: standard path
     let (k_out, v_out) = kv_cache.append(k, v)?;
-    let qjl_bias = kv_cache.qjl_bias(q)?;
-    let sdpa_params = sdpa_params.with_qjl(qjl_bias);
-    Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, &sdpa_params)
+    Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, sdpa_params)
 }

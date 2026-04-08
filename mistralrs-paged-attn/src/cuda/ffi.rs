@@ -518,6 +518,11 @@ extern "C" {
         partial_out: *mut f32,
         partial_max: *mut f32,
         partial_sum: *mut f32,
+        // QJL correction (pass null + 0 when disabled)
+        qjl_signs: *const u8,
+        qjl_residual_norms: *const u16,
+        rq: *const f32,           // Rademacher-projected query, or null
+        qjl_enabled: c_int,
         num_attention_heads: c_int,
         num_kv_heads: c_int,
         head_dim: c_int,

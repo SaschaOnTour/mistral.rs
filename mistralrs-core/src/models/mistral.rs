@@ -14,7 +14,7 @@ use crate::{
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
-    layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -261,10 +261,7 @@ impl Attention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
             }
         };
 

@@ -13,8 +13,6 @@ pub mod encoder_cache;
 pub mod kv_cache_manager;
 mod layers;
 mod scheduler;
-/// TurboQuant KV-cache: parallel quantized storage for TQ3/TQ4 cache types.
-pub mod turboquant_cache;
 pub const _PAD_SLOT_ID: i64 = -1;
 
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
@@ -25,7 +23,7 @@ pub use layers::PagedAttention;
 pub use scheduler::{
     PagedAttentionScheduler, PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
 };
-pub use turboquant_cache::QuantNormMode;
+pub use turboquant::cache::config::QuantNormMode;
 
 use crate::MemoryUsage;
 use tracing::info;

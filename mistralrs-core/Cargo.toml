@@ -78,7 +78,8 @@ serde_plain.workspace = true
 as-any.workspace = true
 float8.workspace = true
 # TODO: Switch back to crates.io before PR: turboquant-rs = "0.2.1"
-turboquant-rs = { path = "../../turboquant" }
+turboquant-rs = { path = "../../turboquant", features = ["candle", "serde"] }
+mistralrs-kv-cache = { path = "../../mistralrs-kv-cache" }
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 toktrie.workspace = true
@@ -123,6 +124,7 @@ cuda = [
     "mistralrs-quant/cuda",
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
+    "turboquant-rs/cuda",
 ]
 cudnn = ["candle-core/cudnn"]
 metal = [

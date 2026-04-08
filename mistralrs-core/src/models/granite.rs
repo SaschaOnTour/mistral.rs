@@ -19,7 +19,7 @@ use crate::{
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -1354,17 +1354,7 @@ impl CausalSelfAttention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask.clone().as_ref(),
-                    Some(flash_params),
-                    &sdpa_params,
-                )?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask.clone().as_ref(), &self.sdpa_params, Some(flash_params))?
             }
         };
 

@@ -16,7 +16,7 @@ use crate::{
     get_delta_from_lora_ab,
     layers::{
         embedding, Activation, CausalMasker, MatMul, PhiRopeConfig, PhiRopeScalingConfig,
-        PhiRotaryEmbedding, RmsNorm, Sdpa,
+        PhiRotaryEmbedding, RmsNorm,
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -217,10 +217,7 @@ impl Attention {
                 }
             },
             _ => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
             }
         };
 

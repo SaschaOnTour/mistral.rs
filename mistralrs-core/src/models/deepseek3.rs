@@ -16,7 +16,7 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RopeScaling,
-        DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
+        DeepSeekV2RotaryEmbedding, Mlp, RmsNorm,
     },
     layers_masker::{masked_fill, PastKvLenCache},
     mla::{
@@ -338,10 +338,10 @@ impl Attention {
             let kv_split =
                 kv.split(&[self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], D::Minus1)?;
             let k_nope = kv_split[0].clone();
-            let mut v = kv_split[1].clone();
+            let v = kv_split[1].clone();
 
             let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?;
-            let mut k = Tensor::cat(
+            let k = Tensor::cat(
                 &[&k_nope, &k_pe.repeat((1, self.num_attention_heads, 1, 1))?],
                 D::Minus1,
             )?
@@ -424,17 +424,7 @@ impl Attention {
                         }
                     },
                     None => {
-                        (k, v) = kv_cache.append(&k, &v)?;
-
-                        let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                        Sdpa.run_attention(
-                            &q,
-                            &k,
-                            &v,
-                            attention_mask,
-                            Some(flash_params),
-                            &sdpa_params,
-                        )?
+                        crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
                     }
                 }
             }

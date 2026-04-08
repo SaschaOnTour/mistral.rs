@@ -14,7 +14,6 @@ use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
 use crate::layers::MatMul;
-use crate::layers::Sdpa;
 use crate::layers::{CausalMasker, QLinear};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::AttentionImplementation;
@@ -115,10 +114,7 @@ impl LayerWeights {
                 )?
             }
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(&q, &k, &v, mask, None, &sdpa_params)?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, mask, &self.sdpa_params, None)?
             }
         };
 

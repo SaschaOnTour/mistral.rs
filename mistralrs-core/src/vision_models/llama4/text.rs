@@ -12,7 +12,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{embedding, Activation, CausalMasker, Llama3RotaryEmbedding, RmsNorm, Sdpa},
+    layers::{embedding, Activation, CausalMasker, Llama3RotaryEmbedding, RmsNorm},
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     ops::{TopKLastDimOp, TopKOutput},
@@ -224,17 +224,7 @@ impl CausalSelfAttention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(
-                    &q.contiguous()?,
-                    &k.contiguous()?,
-                    &v.contiguous()?,
-                    attention_mask.clone().as_ref(),
-                    Some(flash_params),
-                    &sdpa_params,
-                )?
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask.clone().as_ref(), &self.sdpa_params, Some(flash_params))?
             }
         };
 

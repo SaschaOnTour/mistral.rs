@@ -12,7 +12,7 @@ use crate::{
     get_delta_from_lora_ab,
     layers::{
         embedding, CausalMasker, Gemma3RotaryEmbedding, GemmaRmsNorm, MatMul, Mlp, RotaryEmbedding,
-        ScaledEmbedding, Sdpa,
+        ScaledEmbedding,
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -248,12 +248,7 @@ impl Attention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                match flash_params {
-                    Some(fp) => Sdpa.run_attention(&q, &k, &v, mask, Some(fp), &sdpa_params)?,
-                    None => Sdpa.run_attention_noflash(&q, &k, &v, mask, &sdpa_params)?,
-                }
+                crate::attention::cached_attention(kv_cache, &q, &k, &v, mask, &self.sdpa_params, flash_params)?
             }
         };
 

@@ -18,6 +18,9 @@ pub fn tq_fused_attention(
     v_scales: &Tensor,
     codebook: &Tensor,
     sign_pattern: &Tensor,
+    qjl_signs: Option<&Tensor>,
+    qjl_residual_norms: Option<&Tensor>,
+    rq: Option<&Tensor>,
     num_attention_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -111,6 +114,48 @@ pub fn tq_fused_attention(
         let (pm_ptr, _g10) = pm_slice.device_ptr(pm_slice.stream());
         let (ps_ptr, _g11) = ps_slice.device_ptr(ps_slice.stream());
 
+        // QJL: use contiguous() to get owned tensors with stable device pointers
+        let qjl_enabled = qjl_signs.is_some() && qjl_residual_norms.is_some() && rq.is_some();
+        let qjl_signs_cont = if qjl_enabled {
+            Some(qjl_signs.unwrap().contiguous()?)
+        } else {
+            None
+        };
+        let qjl_norms_cont = if qjl_enabled {
+            Some(qjl_residual_norms.unwrap().contiguous()?)
+        } else {
+            None
+        };
+        let rq_cont = if qjl_enabled {
+            Some(rq.unwrap().contiguous()?)
+        } else {
+            None
+        };
+
+        let (qjl_signs_ptr, qjl_norms_ptr, rq_ptr) = if qjl_enabled {
+            let qs = qjl_signs_cont.as_ref().unwrap();
+            let qn = qjl_norms_cont.as_ref().unwrap();
+            let rq_t = rq_cont.as_ref().unwrap();
+            let Storage::Cuda(qs_cuda) = &*qs.storage_and_layout().0 else {
+                candle_core::bail!("qjl_signs must be on CUDA");
+            };
+            let Storage::Cuda(qn_cuda) = &*qn.storage_and_layout().0 else {
+                candle_core::bail!("qjl_residual_norms must be on CUDA");
+            };
+            let Storage::Cuda(rq_cuda) = &*rq_t.storage_and_layout().0 else {
+                candle_core::bail!("rq must be on CUDA");
+            };
+            let qs_slice = qs_cuda.as_cuda_slice::<u8>()?;
+            let qn_slice = qn_cuda.as_cuda_slice::<half::f16>()?;
+            let rq_slice = rq_cuda.as_cuda_slice::<f32>()?;
+            let (qs_ptr, _) = qs_slice.device_ptr(qs_slice.stream());
+            let (qn_ptr, _) = qn_slice.device_ptr(qn_slice.stream());
+            let (rq_p, _) = rq_slice.device_ptr(rq_slice.stream());
+            (qs_ptr as *const u8, qn_ptr as *const u16, rq_p as *const f32)
+        } else {
+            (std::ptr::null(), std::ptr::null(), std::ptr::null())
+        };
+
         unsafe {
             ffi::tq_fused_attention(
                 q_ptr as *const f32,
@@ -124,6 +169,10 @@ pub fn tq_fused_attention(
                 po_ptr as *mut f32,
                 pm_ptr as *mut f32,
                 ps_ptr as *mut f32,
+                qjl_signs_ptr,
+                qjl_norms_ptr,
+                rq_ptr,
+                qjl_enabled as i32,
                 num_attention_heads as i32,
                 num_kv_heads as i32,
                 head_dim as i32,

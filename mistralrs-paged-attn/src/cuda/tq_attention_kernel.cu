@@ -71,6 +71,11 @@ __global__ void tq_fused_attention_decode(
     float          *__restrict__ partial_out,
     float          *__restrict__ partial_max,
     float          *__restrict__ partial_sum,
+    /* QJL correction (nullable: pass nullptr when qjl_enabled=0) */
+    const uint8_t  *__restrict__ qjl_signs,
+    const uint16_t *__restrict__ qjl_residual_norms,
+    const float    *__restrict__ rq,  /* Rademacher-projected query [num_attention_heads, head_dim] */
+    int             qjl_enabled,
     int             num_attention_heads,
     int             num_kv_heads,
     int             head_dim,
@@ -129,6 +134,13 @@ __global__ void tq_fused_attention_decode(
     const float *q_head = q + head * head_dim;
     float q_val = q_head[qb * 32 + lane];
 
+    /* QJL: load precomputed Rademacher-projected query r_q = R^T @ q.
+     * Computed on host via matmul (fast), passed as kernel parameter. */
+    float rq_val = 0.0f;
+    if (qjl_enabled) {
+        rq_val = rq[head * head_dim + qb * 32 + lane];
+    }
+
     /* Per-group online softmax (all warps in group share same state via registers) */
     float group_max = -FLT_MAX;
     float group_sum = 0.0f;
@@ -138,6 +150,13 @@ __global__ void tq_fused_attention_decode(
     const uint16_t *ks_base = k_scales  + kv_head * kv_stride * num_qblocks;
     const uint8_t  *vi_base = v_indices + kv_head * kv_stride * packed_dim;
     const uint16_t *vs_base = v_scales  + kv_head * kv_stride * num_qblocks;
+
+    /* QJL base pointers (only valid when qjl_enabled) */
+    const int signs_per_head = head_dim / 8;
+    const uint8_t  *qjl_signs_base = qjl_enabled
+        ? qjl_signs + kv_head * kv_stride * signs_per_head : nullptr;
+    const uint16_t *qjl_norms_base = qjl_enabled
+        ? qjl_residual_norms + kv_head * kv_stride : nullptr;
 
     for (int token = part_start + group_idx; token < part_end; token += num_token_groups) {
         /* --- K dequant: each warp dequants its qblock in parallel --- */
@@ -169,6 +188,47 @@ __global__ void tq_fused_attention_decode(
         }
         /* Broadcast score to all lanes in the warp */
         score = __shfl_sync(0xffffffff, score, 0);
+
+        /* --- QJL correction: dot(r_q, unpacked_signs) * norm * sqrt(pi/2) / sqrt(dim) ---
+         *
+         * r_q (Rademacher-projected query) is precomputed before the token loop.
+         * Each warp handles its qblock (32 elements) of the dot product,
+         * then we reduce across warps in the group (same as QK reduction). */
+        if (qjl_enabled) {
+            float norm = __half2float(
+                *((const __half *)(qjl_norms_base + token)));
+
+            /* Unpack this lane's sign bit from packed U8 */
+            int global_dim_idx = qb * 32 + lane;
+            int byte_idx = global_dim_idx / 8;
+            int bit_idx  = global_dim_idx % 8;
+            const uint8_t *signs = qjl_signs_base + token * signs_per_head;
+            float sign_val = ((signs[byte_idx] >> bit_idx) & 1) ? 1.0f : -1.0f;
+
+            /* Partial dot: r_q[qb*32+lane] * sign_val */
+            float partial_corr = rq_val * sign_val;
+
+            /* Warp-local reduce (sum 32 lanes) */
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                partial_corr += __shfl_xor_sync(0xffffffff, partial_corr, offset);
+
+            /* Cross-warp reduce within group (sum all qblocks) */
+            if (lane == 0)
+                s_group_qk[group_idx * warps_per_token + qb] = partial_corr;
+            __syncthreads();
+
+            float correction = 0.0f;
+            if (lane == 0) {
+                for (int w = 0; w < warps_per_token; w++)
+                    correction += s_group_qk[group_idx * warps_per_token + w];
+                /* Scale: norm * sqrt(π/2) / sqrt(dim) */
+                correction *= norm * 1.2533141f * rsqrtf((float)head_dim);
+                score += correction * softmax_scale;
+            }
+            score = __shfl_sync(0xffffffff, score, 0);
+            __syncthreads();
+        }
 
         /* --- Online softmax (all warps in group get same score) --- */
         float old_max = group_max;
@@ -286,6 +346,11 @@ extern "C" void tq_fused_attention(
     float          *partial_out,
     float          *partial_max_buf,
     float          *partial_sum_buf,
+    /* QJL correction (pass nullptr + 0 when disabled) */
+    const uint8_t  *qjl_signs,
+    const uint16_t *qjl_residual_norms,
+    const float    *rq,            /* Rademacher-projected query, or nullptr */
+    int32_t         qjl_enabled,
     int32_t         num_attention_heads,
     int32_t         num_kv_heads,
     int32_t         head_dim,
@@ -315,6 +380,7 @@ extern "C" void tq_fused_attention(
         q, k_indices, k_scales, v_indices, v_scales,
         codebook, sign_pattern,
         partial_out, partial_max_buf, partial_sum_buf,
+        qjl_signs, qjl_residual_norms, rq, qjl_enabled,
         num_attention_heads, num_kv_heads,
         head_dim, kv_len, kv_stride, packed_dim, num_qblocks, bits, softmax_scale,
         num_partitions);

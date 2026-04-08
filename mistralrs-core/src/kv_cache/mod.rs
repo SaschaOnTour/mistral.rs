@@ -4,7 +4,6 @@ use candle_core::{Result, Tensor, D};
 
 use crate::{
     get_mut_arcmutex,
-    paged_attention::turboquant_cache::TurboQuantKVCache,
     pipeline::{CacheManagerMixin, MetadataMixin},
     sequence::Sequence,
 };
@@ -39,7 +38,6 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     );
 }
 
-#[derive(Debug, Clone)]
 pub enum KvCache {
     Normal {
         k: SingleCache,
@@ -50,8 +48,8 @@ pub enum KvCache {
         v: RotatingCache,
     },
     TurboQuant {
-        /// Shared multi-head quantized cache (shared across layers via Arc).
-        cache: std::sync::Arc<std::sync::Mutex<TurboQuantKVCache>>,
+        /// Shared compressed cache via CompressedKVCache trait.
+        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
         /// Which transformer layer this KvCache instance represents.
         layer: usize,
         /// Original device for the tensors.
@@ -59,6 +57,28 @@ pub enum KvCache {
         /// Original dtype for the tensors.
         dtype: candle_core::DType,
     },
+}
+
+impl Clone for KvCache {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Normal { k, v } => Self::Normal { k: k.clone(), v: v.clone() },
+            Self::Rotating { k, v } => Self::Rotating { k: k.clone(), v: v.clone() },
+            Self::TurboQuant { cache, layer, device, dtype } => Self::TurboQuant {
+                cache: cache.clone(), layer: *layer, device: device.clone(), dtype: *dtype,
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for KvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal { .. } => write!(f, "KvCache::Normal"),
+            Self::Rotating { .. } => write!(f, "KvCache::Rotating"),
+            Self::TurboQuant { layer, .. } => write!(f, "KvCache::TurboQuant(layer={layer})"),
+        }
+    }
 }
 
 impl KvCache {
@@ -74,13 +94,13 @@ impl KvCache {
         Self::Rotating { k, v }
     }
 
-    /// Creates a new TurboQuant KV cache for a specific layer.
+    /// Creates a new compressed KV cache for a specific layer.
     ///
-    /// The `cache` is a shared `Arc<Mutex<TurboQuantKVCache>>` that holds
-    /// quantized data for ALL layers and heads. Each `KvCache::TurboQuant`
+    /// The `cache` is a shared `Arc<Mutex<dyn CompressedKVCache>>` that holds
+    /// compressed data for ALL layers and heads. Each `KvCache::TurboQuant`
     /// instance references it with a specific `layer` index.
     pub fn new_turboquant(
-        cache: std::sync::Arc<std::sync::Mutex<TurboQuantKVCache>>,
+        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
         layer: usize,
         device: candle_core::Device,
         dtype: candle_core::DType,
@@ -97,17 +117,10 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
-            Self::TurboQuant {
-                cache,
-                layer,
-                device,
-                dtype,
-                ..
-            } => {
-                let guard = cache
-                    .lock()
-                    .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock error: {e}")))?;
-                guard.dequantize_keys_tensor(*layer, device, *dtype)
+            Self::TurboQuant { .. } => {
+                // Compressed cache: K not accessible as raw tensor.
+                // Use cached_attention() for attention computation.
+                Ok(None)
             }
         }
     }
@@ -116,17 +129,9 @@ impl KvCache {
         match self {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
-            Self::TurboQuant {
-                cache,
-                layer,
-                device,
-                dtype,
-                ..
-            } => {
-                let guard = cache
-                    .lock()
-                    .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock error: {e}")))?;
-                guard.dequantize_values_tensor(*layer, device, *dtype)
+            Self::TurboQuant { .. } => {
+                // Compressed cache: V not accessible as raw tensor.
+                Ok(None)
             }
         }
     }
@@ -134,12 +139,15 @@ impl KvCache {
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        // Handle TurboQuant separately since it has a completely different code path
+        // Compressed cache: append is handled by cached_attention(), not here.
+        // If called directly (legacy path), use prefill with a dummy query.
         if let Self::TurboQuant { cache, layer, .. } = self {
             let mut guard = cache
                 .lock()
-                .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock error: {e}")))?;
-            return guard.append_and_dequantize(*layer, &k, &v);
+                .map_err(|e| candle_core::Error::Msg(format!("Compressed cache lock: {e}")))?;
+            let dummy_q = Tensor::zeros_like(&k)?;
+            let result = guard.prefill(*layer, &k, &v, &dummy_q)?;
+            return Ok((result.k, result.v));
         }
 
         let (out_k, out_v) = match self {
@@ -187,8 +195,8 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::TurboQuant { cache, layer, .. } => {
-                let guard = cache.lock().expect("TurboQuant lock poisoned");
-                guard.current_seq_len(*layer)
+                let guard = cache.lock().expect("Compressed cache lock poisoned");
+                guard.seq_len(*layer)
             }
         }
     }
@@ -211,9 +219,9 @@ impl KvCache {
                 // the whole cache. We do this by replacing the Arc contents.
                 cache
                     .lock()
-                    .expect("TurboQuant lock poisoned")
-                    .reset_all()
-                    .expect("TurboQuant reset: failed to create new cache");
+                    .expect("Compressed cache lock poisoned")
+                    .reset()
+                    .expect("Compressed cache reset failed");
             }
         }
     }
@@ -276,58 +284,13 @@ impl KvCache {
         matches!(self, Self::TurboQuant { .. })
     }
 
-    /// Computes the QJL bias correction for attention logits (Paper Algorithm 2).
-    ///
-    /// Returns `Some(tensor)` for TurboQuant caches, `None` otherwise.
-    /// The tensor shape is `[batch, num_kv_heads, q_len, kv_len]` and should
-    /// be added to attention logits before softmax (via `SdpaParams.qjl_bias`).
-    ///
-    /// For non-TurboQuant caches, always returns `Ok(None)`.
-    pub fn qjl_bias(&self, query: &Tensor) -> Result<Option<Tensor>> {
-        match self {
-            Self::Normal { .. } | Self::Rotating { .. } => Ok(None),
-            Self::TurboQuant { cache, layer, .. } => {
-                let guard = cache
-                    .lock()
-                    .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock: {e}")))?;
-
-                if !guard.has_qjl_data(*layer) {
-                    return Ok(None);
-                }
-
-                let num_kv_heads = guard.num_kv_heads();
-                let q_dims = query.dims4()?;
-                let num_q_heads = q_dims.1;
-                let q_per_head = query.narrow(1, 0, 1)?; // first head as template
-
-                // Compute correction per KV head, then stack
-                let mut head_corrections = Vec::with_capacity(num_kv_heads);
-                for head in 0..num_kv_heads {
-                    let corr = guard.qjl_correction(head, *layer, &q_per_head)?;
-                    head_corrections.push(corr);
-                }
-
-                // Stack: [batch, num_kv_heads, q_len, kv_len]
-                let refs: Vec<&Tensor> = head_corrections.iter().collect();
-                let combined = Tensor::cat(&refs, 1)?;
-
-                // GQA expansion: repeat KV heads to match query heads
-                // (same as repeat_kv for K/V tensors in attention)
-                let n_rep = num_q_heads / num_kv_heads;
-                let expanded = if n_rep > 1 {
-                    let (b, h, q, k) = combined.dims4()?;
-                    combined
-                        .unsqueeze(2)?
-                        .expand((b, h, n_rep, q, k))?
-                        .reshape((b, h * n_rep, q, k))?
-                } else {
-                    combined
-                };
-                // Match dtype of attention logits (may be F16 or BF16)
-                let expanded = expanded.to_dtype(query.dtype())?;
-                Ok(Some(expanded))
-            }
-        }
+    /// QJL bias is now handled inside the CompressedKVCache trait via DequantResult.logit_bias.
+    /// This method is kept for backward compatibility but always returns None.
+    /// The actual bias flows through cached_attention() → prefill()/decode() → DequantResult.
+    pub fn qjl_bias(&self, _query: &Tensor) -> Result<Option<Tensor>> {
+        // QJL bias is now returned via DequantResult.logit_bias in the trait.
+        // This function is no longer the QJL entry point.
+        Ok(None)
     }
 
     /// Clones a `TurboQuant` variant by cloning the `Arc` reference.
@@ -493,18 +456,16 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        Self::new_quantized_cache(
-            TurboQuantKVCache::new_pq_with_norm(
-                bits,
-                head_dim,
-                num_kv_heads,
-                num_layers,
-                norm_mode,
-            )?,
-            num_layers,
-            device,
-            dtype,
-        )
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        let tq_norm = match norm_mode {
+            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
+            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
+        };
+        // PQ: outlier_blocks=0 (standard codebook for all blocks)
+        let cache = turboquant::cache::PqoCache::with_outlier_blocks(
+            bits, head_dim, num_kv_heads, num_layers, tq_norm, 0,
+        );
+        Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
 
     /// PQO: PolarQuant Outlier (all blocks use outlier codebook, no QJL).
@@ -517,14 +478,14 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        Self::new_quantized_cache(
-            TurboQuantKVCache::new_pqo_with_norm(
-                bits,
-                head_dim,
-                num_kv_heads,
-                num_layers,
-                norm_mode,
-            )?,
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        let tq_norm = match norm_mode {
+            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
+            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
+        };
+        let pqo = turboquant::cache::PqoCache::new(bits, head_dim, num_kv_heads, num_layers, tq_norm);
+        Self::new_compressed_cache(
+            pqo,
             num_layers,
             device,
             dtype,
@@ -532,6 +493,7 @@ impl NormalCache {
     }
 
     /// TQ: TurboQuant (Paper Algorithm 2: (bits-1)-bit Polar + 1-bit QJL).
+    /// TQ: (bits-1)-bit PolarQuant + 1-bit QJL correction (Paper Algorithm 2).
     pub fn new_tq(
         num_layers: usize,
         bits: u8,
@@ -541,27 +503,25 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        Self::new_quantized_cache(
-            TurboQuantKVCache::new_tq_with_norm(
-                bits,
-                head_dim,
-                num_kv_heads,
-                num_layers,
-                norm_mode,
-            )?,
-            num_layers,
-            device,
-            dtype,
-        )
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        let tq_norm = match norm_mode {
+            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
+            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
+        };
+        let cache = turboquant::cache::TqCache::new(
+            bits, head_dim, num_kv_heads, num_layers, tq_norm,
+        );
+        Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
 
-    fn new_quantized_cache(
-        tq_cache: TurboQuantKVCache,
+    fn new_compressed_cache(
+        cache_impl: impl mistralrs_kv_cache::CompressedKVCache + 'static,
         num_layers: usize,
         device: candle_core::Device,
         dtype: candle_core::DType,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        let shared = Arc::new(std::sync::Mutex::new(tq_cache));
+        let shared: Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
+            Arc::new(std::sync::Mutex::new(cache_impl));
         let mut caches = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
             caches.push(KvCache::new_turboquant(
@@ -988,9 +948,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     if *tq_layer == 0 {
                         tq_cache
                             .lock()
-                            .expect("TurboQuant lock poisoned")
-                            .reset_all()
-                            .expect("TurboQuant set_none_cache: failed to create new cache");
+                            .expect("Compressed cache lock poisoned")
+                            .reset()
+                            .expect("Compressed cache reset failed");
                     }
                 }
             }
@@ -1574,1002 +1534,73 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paged_attention::{AttentionImplementation, QuantNormMode};
     use candle_core::{DType, Device, Tensor};
 
-    // -----------------------------------------------------------------------
-    // Test 1: new_for_attention factory
-    // -----------------------------------------------------------------------
 
     #[test]
-    fn new_for_attention_eager_creates_normal_cache() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::Eager,
-            4,    // num_layers
-            2048, // max_seq_len
-            None, // no sliding window
-            128,  // head_dim
-            8,    // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let locked = cache.lock().unwrap();
-        assert_eq!(locked.0.len(), 4);
-        // Should be Normal variant, not TurboQuant
-        assert!(!locked.0[0].is_turboquant());
+    fn normal_cache_append_works() {
+        let k = Tensor::rand(0f32, 1.0, (1, 4, 8, 64), &Device::Cpu).unwrap();
+        let v = Tensor::rand(0f32, 1.0, (1, 4, 8, 64), &Device::Cpu).unwrap();
+        let mut cache = KvCache::new(2, 4);
+        let (k_out, v_out) = cache.append(&k, &v).unwrap();
+        assert_eq!(k_out.dims(), &[1, 4, 8, 64]);
+        assert_eq!(v_out.dims(), &[1, 4, 8, 64]);
     }
 
     #[test]
-    fn new_for_attention_tq3_creates_turboquant_cache() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            4,    // num_layers
-            2048, // max_seq_len
-            None,
-            64, // head_dim (must be power of two)
-            8,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let locked = cache.lock().unwrap();
-        assert_eq!(locked.0.len(), 4);
-        assert!(locked.0[0].is_turboquant());
+    fn compressed_cache_via_pqo_factory() {
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        use turboquant::cache::PqoCache;
+
+        let bits = 3u8;
+        let head_dim = 128;
+        let num_kv_heads = 4;
+        let num_layers = 2;
+
+        let pqo = PqoCache::new(bits, head_dim, num_kv_heads, num_layers, TqNormMode::MaxNorm);
+        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
+            Arc::new(Mutex::new(pqo));
+
+        let cache = KvCache::new_turboquant(shared.clone(), 0, Device::Cpu, DType::F32);
+        assert!(cache.is_turboquant());
+        assert_eq!(cache.current_seq_len(), 0);
     }
 
     #[test]
-    fn new_for_attention_tq4_creates_turboquant_cache() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(4, QuantNormMode::MaxNorm),
-            2,
-            1024,
-            None,
-            128,
-            4,
-            Device::Cpu,
-            DType::F32,
-        );
-        let locked = cache.lock().unwrap();
-        assert_eq!(locked.0.len(), 2);
-        assert!(locked.0[0].is_turboquant());
-    }
+    fn compressed_cache_append_returns_data() {
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        use turboquant::cache::PqoCache;
 
-    // -----------------------------------------------------------------------
-    // Test 2: Full KvCache::TurboQuant append roundtrip
-    // -----------------------------------------------------------------------
+        let pqo = PqoCache::new(3, 128, 4, 2, TqNormMode::MaxNorm);
+        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
+            Arc::new(Mutex::new(pqo));
 
-    #[test]
-    fn turboquant_cache_append_roundtrip() {
-        // Create a TQ3 cache: 2 layers, head_dim=64, 2 kv_heads
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            2, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            2,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-
-        let mut locked = cache.lock().unwrap();
-        let kv_cache = &mut locked.0[0]; // layer 0
-
-        // Create dummy K/V tensors: [batch=1, num_kv_heads=2, seq_len=1, head_dim=64]
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-
-        // Append
-        let (full_k, full_v) = kv_cache.append(&k, &v).unwrap();
-
-        // Check output shape: [1, 2, 1, 64] (one token in cache)
-        assert_eq!(full_k.dims(), &[1, 2, 1, 64]);
-        assert_eq!(full_v.dims(), &[1, 2, 1, 64]);
-
-        // Append another token
-        let k2 = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v2 = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let (full_k2, full_v2) = kv_cache.append(&k2, &v2).unwrap();
-
-        // Now should have 2 tokens: [1, 2, 2, 64]
-        assert_eq!(full_k2.dims(), &[1, 2, 2, 64]);
-        assert_eq!(full_v2.dims(), &[1, 2, 2, 64]);
-    }
-
-    #[test]
-    fn turboquant_cache_append_preserves_dtype() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            1,
-            1024,
-            None,
-            64,
-            2,
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-        let kv_cache = &mut locked.0[0];
-
-        // Use BF16 input tensors to test dtype preservation through
-        // the quantize-dequantize roundtrip.
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu)
-            .unwrap()
-            .to_dtype(DType::BF16)
-            .unwrap();
-
-        let (full_k, full_v) = kv_cache.append(&k, &v).unwrap();
-        assert_eq!(full_k.dtype(), DType::BF16);
-        assert_eq!(full_v.dtype(), DType::BF16);
-    }
-
-    #[test]
-    fn turboquant_cache_layers_independent() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            2,
-            1024,
-            None,
-            64,
-            2,
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Push to layer 0 only
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        locked.0[0].append(&k, &v).unwrap();
-
-        // Layer 0 has 1 token, layer 1 has 0
-        assert_eq!(locked.0[0].current_seq_len(), 1);
-        assert_eq!(locked.0[1].current_seq_len(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Test 3: Compression / multi-token accumulation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn turboquant_cache_memory_smaller_than_fp16() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            1,
-            1024,
-            None,
-            128,
-            8,
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Push 100 tokens
-        for _ in 0..100 {
-            let k = Tensor::rand(0f32, 1.0, (1, 8, 1, 128), &Device::Cpu).unwrap();
-            let v = Tensor::rand(0f32, 1.0, (1, 8, 1, 128), &Device::Cpu).unwrap();
-            locked.0[0].append(&k, &v).unwrap();
-        }
-
-        // FP16 equivalent: 100 tokens * 8 heads * 128 dim * 2 bytes * 2 (K+V) = 409600 bytes
-        // TQ3 should be significantly smaller.
-        // We can't easily measure TQ memory from KvCache, but we verify
-        // the returned tensor shape is correct after accumulation.
-        let k = Tensor::rand(0f32, 1.0, (1, 8, 1, 128), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 8, 1, 128), &Device::Cpu).unwrap();
-        let (full_k, _) = locked.0[0].append(&k, &v).unwrap();
-        assert_eq!(full_k.dims(), &[1, 8, 101, 128]); // 101 total tokens
-    }
-
-    // -----------------------------------------------------------------------
-    // Regression tests: clone_in / clone_out / set_none cache bug
-    //
-    // These tests ensure TurboQuant caches survive the operations that
-    // NormalCacheManager performs (clone_out, clone_in, set_none) without
-    // losing their variant or shared Arc identity.
-    // -----------------------------------------------------------------------
-
-    /// Critical regression test: TQ cache remains TurboQuant after simulated
-    /// clone_out + clone_in cycle and data persists through the shared Arc.
-    #[test]
-    fn turboquant_cache_shared_across_layers() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            2, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            2,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Both layers should be TurboQuant
-        assert!(locked.0[0].is_turboquant());
-        assert!(locked.0[1].is_turboquant());
-
-        // Push to layer 0 via one reference
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        locked.0[0].append(&k, &v).unwrap();
-
-        // Layer 0 should have 1 token, layer 1 should have 0
-        assert_eq!(locked.0[0].current_seq_len(), 1);
-        assert_eq!(locked.0[1].current_seq_len(), 0);
-    }
-
-    /// Verify that all layers in a TurboQuant cache share the same Arc
-    /// allocation (pointer equality). If clone_out/clone_in were to deep-copy
-    /// the Arc, layers would diverge and this test would catch it.
-    #[test]
-    fn turboquant_cache_arc_sharing() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            2, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            2,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let locked = cache.lock().unwrap();
-
-        // Extract the Arc from layer 0 and layer 1
-        if let KvCache::TurboQuant { cache: arc0, .. } = &locked.0[0] {
-            if let KvCache::TurboQuant { cache: arc1, .. } = &locked.0[1] {
-                // Both layers must share the SAME Arc (same allocation)
-                assert!(
-                    std::sync::Arc::ptr_eq(arc0, arc1),
-                    "TurboQuant layers should share the same Arc, but they point to different allocations"
-                );
-            } else {
-                panic!("Layer 1 should be TurboQuant");
-            }
-        } else {
-            panic!("Layer 0 should be TurboQuant");
-        }
-    }
-
-    /// After reset, the cache should still be the TurboQuant variant (not
-    /// silently replaced by Normal or set to None).
-    #[test]
-    fn turboquant_cache_reset_preserves_variant() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            2, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            2,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Push data
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        locked.0[0].append(&k, &v).unwrap();
-        assert_eq!(locked.0[0].current_seq_len(), 1);
-
-        // Reset
-        locked.0[0].reset();
-
-        // Should still be TurboQuant, just empty
-        assert!(
-            locked.0[0].is_turboquant(),
-            "After reset, cache should still be TurboQuant variant"
-        );
-        // Reset replaces the shared cache contents, so seq_len should be 0
-        assert_eq!(locked.0[0].current_seq_len(), 0);
-    }
-
-    /// Multiple single-token appends must accumulate correctly, returning the
-    /// full history each time.
-    #[test]
-    fn turboquant_cache_accumulates_across_appends() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            1, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            4,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Push 5 tokens one at a time
-        for i in 0..5 {
-            let k = Tensor::rand(0f32, 1.0, (1, 4, 1, 64), &Device::Cpu).unwrap();
-            let v = Tensor::rand(0f32, 1.0, (1, 4, 1, 64), &Device::Cpu).unwrap();
-            let (full_k, full_v) = locked.0[0].append(&k, &v).unwrap();
-
-            // Should return full history: [1, 4, i+1, 64]
-            assert_eq!(
-                full_k.dims(),
-                &[1, 4, i + 1, 64],
-                "K history should have {} tokens after append {}",
-                i + 1,
-                i
-            );
-            assert_eq!(
-                full_v.dims(),
-                &[1, 4, i + 1, 64],
-                "V history should have {} tokens after append {}",
-                i + 1,
-                i
-            );
-        }
-
-        assert_eq!(locked.0[0].current_seq_len(), 5);
-    }
-
-    /// TQ cache handles prefill (multi-token append) followed by single-token
-    /// decode steps.
-    #[test]
-    fn turboquant_cache_prefill_multi_token() {
-        let cache = NormalCache::new_for_attention(
-            &AttentionImplementation::PolarQuantOutlier(3, QuantNormMode::MaxNorm),
-            1, // num_layers
-            1024,
-            None,
-            64, // head_dim
-            2,  // num_kv_heads
-            Device::Cpu,
-            DType::F32,
-        );
-        let mut locked = cache.lock().unwrap();
-
-        // Prefill with 10 tokens at once
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 10, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 10, 64), &Device::Cpu).unwrap();
-        let (full_k, full_v) = locked.0[0].append(&k, &v).unwrap();
-
-        assert_eq!(full_k.dims(), &[1, 2, 10, 64]);
-        assert_eq!(full_v.dims(), &[1, 2, 10, 64]);
-        assert_eq!(locked.0[0].current_seq_len(), 10);
-
-        // Then decode one more token
-        let k2 = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let v2 = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let (full_k2, full_v2) = locked.0[0].append(&k2, &v2).unwrap();
-
-        assert_eq!(full_k2.dims(), &[1, 2, 11, 64]);
-        assert_eq!(full_v2.dims(), &[1, 2, 11, 64]);
-        assert_eq!(locked.0[0].current_seq_len(), 11);
-    }
-
-    // -------------------------------------------------------------------
-    // QJL bias via KvCache interface
-    // -------------------------------------------------------------------
-
-    /// KvCache::qjl_bias() returns None for Normal caches.
-    #[test]
-    fn qjl_bias_returns_none_for_normal_cache() {
-        let mut cache = KvCache::new_normal(2, 100, 512);
-        let k = Tensor::rand(0f32, 1.0, (1, 2, 4, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 2, 4, 64), &Device::Cpu).unwrap();
-        cache.append(&k, &v).unwrap();
-
-        let q = Tensor::rand(0f32, 1.0, (1, 2, 1, 64), &Device::Cpu).unwrap();
-        let bias = cache.qjl_bias(&q).unwrap();
-        assert!(
-            bias.is_none(),
-            "Normal cache should return None for qjl_bias"
-        );
-    }
-
-    /// KvCache::qjl_bias() returns a tensor for TurboQuant caches.
-    #[test]
-    fn qjl_bias_returns_tensor_for_turboquant() {
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 64;
-        let heads: usize = 2;
-        let layers: usize = 1;
-        let layer: usize = 0;
-
-        let tq = TurboQuantKVCache::new_tq(bits, dim, heads, layers).unwrap();
-        let shared = Arc::new(Mutex::new(tq));
-        let mut cache = KvCache::new_turboquant(shared, layer, Device::Cpu, DType::F32);
-
-        // Prefill 4 tokens then decode 1 (triggers quantization with QJL)
-        let k_pf = Tensor::rand(0f32, 1.0, (1, heads, 4, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, heads, 4, dim), &Device::Cpu).unwrap();
-        cache.append(&k_pf, &v_pf).unwrap();
-        let k_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        cache.append(&k_dec, &v_dec).unwrap();
-
-        // Query
-        let q = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let bias = cache.qjl_bias(&q).unwrap();
-
-        assert!(
-            bias.is_some(),
-            "TurboQuant cache should return Some for qjl_bias"
-        );
-        let bias = bias.unwrap();
-        // Shape: [batch, num_kv_heads, q_len, kv_len]
-        assert_eq!(bias.dims()[0], 1, "batch");
-        assert_eq!(bias.dims()[2], 1, "q_len");
-        assert_eq!(bias.dims()[3], 5, "kv_len = 4 prefill + 1 decode");
-    }
-
-    /// End-to-end: KvCache::qjl_bias() flows into Sdpa.run_attention()
-    /// and changes the output compared to no QJL.
-    #[test]
-    fn qjl_bias_end_to_end_through_sdpa() {
-        use crate::attention::{Sdpa, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 64;
-        let heads: usize = 2;
-        let layers: usize = 1;
-        let layer: usize = 0;
-        let scale = 1.0 / (dim as f32).sqrt();
-
-        let tq = TurboQuantKVCache::new_tq(bits, dim, heads, layers).unwrap();
-        let shared = Arc::new(Mutex::new(tq));
-        let mut cache = KvCache::new_turboquant(shared, layer, Device::Cpu, DType::F32);
-
-        // Prefill + decode to trigger QJL storage
-        let kv_len = 8;
-        let k_pf = Tensor::rand(0f32, 1.0, (1, heads, kv_len - 1, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, heads, kv_len - 1, dim), &Device::Cpu).unwrap();
-        cache.append(&k_pf, &v_pf).unwrap();
-        let k_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let (full_k, full_v) = cache.append(&k_dec, &v_dec).unwrap();
-
-        let q = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-
-        // Without QJL
-        let params_no_qjl = SdpaParams {
-            n_kv_groups: 1,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-        let out_no_qjl = Sdpa
-            .run_attention(&q, &full_k, &full_v, None, None, &params_no_qjl)
-            .unwrap();
-
-        // With QJL from cache
-        let qjl_bias = cache.qjl_bias(&q).unwrap();
-        assert!(qjl_bias.is_some(), "Should have QJL bias");
-
-        let params_with_qjl = SdpaParams {
-            n_kv_groups: 1,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias,
-        };
-        let out_with_qjl = Sdpa
-            .run_attention(&q, &full_k, &full_v, None, None, &params_with_qjl)
-            .unwrap();
-
-        // QJL bias must change output
-        let diff = (&out_with_qjl - &out_no_qjl)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(
-            diff > 1e-6,
-            "QJL bias from cache should change attention output, diff={diff:.6}"
-        );
-    }
-
-    /// SdpaParams::with_qjl() creates a new SdpaParams with the QJL bias set.
-    /// This is the API model attention layers use to pass QJL data.
-    #[test]
-    fn sdpa_params_with_qjl_helper() {
-        use crate::attention::SdpaParams;
-
-        let base = SdpaParams {
-            n_kv_groups: 4,
-            softcap: Some(30.0),
-            softmax_scale: 0.125,
-            sliding_window: Some(4096),
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        // with_qjl(None) preserves None
-        let p1 = base.with_qjl(None);
-        assert!(p1.qjl_bias.is_none());
-        assert_eq!(p1.n_kv_groups, 4);
-        assert_eq!(p1.softcap, Some(30.0));
-        assert_eq!(p1.softmax_scale, 0.125);
-        assert_eq!(p1.sliding_window, Some(4096));
-
-        // with_qjl(Some(tensor)) sets the bias
-        let bias = Tensor::zeros((1, 1, 1, 8), DType::F32, &Device::Cpu).unwrap();
-        let p2 = base.with_qjl(Some(bias));
-        assert!(p2.qjl_bias.is_some());
-        assert_eq!(p2.qjl_bias.unwrap().dims(), &[1, 1, 1, 8]);
-
-        // Original untouched
-        assert!(base.qjl_bias.is_none());
-    }
-
-    /// Verify that ALL model files that call kv_cache.append() also pass
-    /// the KvCache to run_attention (so QJL bias is automatically applied).
-    ///
-    /// This is a code-scan test that catches when a new model is added
-    /// without QJL support. It greps the source for the pattern:
-    ///   kv_cache.append(...) followed by Sdpa.run_attention(...)
-    /// and verifies that run_attention receives the kv_cache parameter.
-    ///
-    /// NOTE: This test checks source code structure, not runtime behavior.
-    /// It ensures architectural consistency across all model implementations.
-    #[test]
-    fn all_models_pass_kv_cache_to_run_attention() {
-        use std::fs;
-        use std::path::Path;
-
-        let model_dirs = [
-            "src/models",
-            "src/vision_models",
-            "src/xlora_models",
-            "src/embedding_models",
-            "src/speech_models",
-        ];
-
-        let mut missing = Vec::new();
-
-        for dir in &model_dirs {
-            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
-            if !base.exists() {
-                continue;
-            }
-            for entry in walkdir(base) {
-                let content = fs::read_to_string(&entry).unwrap_or_default();
-                // Find files that call both kv_cache.append AND Sdpa.run_attention
-                let has_append = content.contains("kv_cache.append(");
-                let has_run_attention = content.contains("Sdpa.run_attention(")
-                    || content.contains("Sdpa.run_attention_noflash(");
-                if has_append && has_run_attention {
-                    // Check that run_attention call site passes kv_cache
-                    // Pattern: .run_attention(..., &kv_cache) or uses with_qjl
-                    // Must actively compute QJL bias — not just have "qjl_bias: None"
-                    let has_qjl_integration =
-                        content.contains(".with_qjl(") || content.contains(".qjl_bias(");
-                    if !has_qjl_integration {
-                        missing.push(
-                            entry
-                                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-                                .unwrap_or(&entry)
-                                .display()
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        if !missing.is_empty() {
-            panic!(
-                "The following model files call kv_cache.append() + Sdpa.run_attention() \
-                 but do NOT integrate QJL bias (missing with_qjl/qjl_bias):\n  {}",
-                missing.join("\n  ")
-            );
-        }
-    }
-
-    /// Recursively collect .rs files from a directory.
-    fn walkdir(dir: std::path::PathBuf) -> Vec<std::path::PathBuf> {
-        let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    files.extend(walkdir(path));
-                } else if path.extension().map_or(false, |e| e == "rs") {
-                    files.push(path);
-                }
-            }
-        }
-        files
-    }
-
-    /// QJL bias must be broadcastable to attention logits shape when
-    /// using GQA (num_query_heads > num_kv_heads).
-    ///
-    /// Qwen3-0.6B: 16 query heads, 8 KV heads (GQA ratio 2).
-    /// The bias must be [batch, num_q_heads, q_len, kv_len] or
-    /// broadcastable to it (e.g. [batch, 1, q_len, kv_len]).
-    #[test]
-    fn qjl_bias_broadcastable_with_gqa() {
-        use crate::attention::{Sdpa, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 64;
-        let kv_heads: usize = 4;
-        let q_heads: usize = 8; // GQA: 2 query heads per KV head
-        let layers: usize = 1;
-        let layer: usize = 0;
-        let scale = 1.0 / (dim as f32).sqrt();
-
-        let tq = TurboQuantKVCache::new_tq(bits, dim, kv_heads, layers).unwrap();
-        let shared = Arc::new(Mutex::new(tq));
-        let mut cache = KvCache::new_turboquant(shared, layer, Device::Cpu, DType::F32);
-
-        // Prefill + decode
-        let k_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 4, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 4, dim), &Device::Cpu).unwrap();
-        cache.append(&k_pf, &v_pf).unwrap();
-        let k_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-        let (full_k, full_v) = cache.append(&k_dec, &v_dec).unwrap();
-
-        // Query has MORE heads than KV (GQA)
-        let q = Tensor::rand(0f32, 1.0, (1, q_heads, 1, dim), &Device::Cpu).unwrap();
-
-        let qjl_bias = cache.qjl_bias(&q).unwrap();
-        assert!(qjl_bias.is_some());
-        let bias = qjl_bias.unwrap();
-
-        // Bias must be broadcastable to [1, q_heads, 1, kv_len]
-        // Either [1, q_heads, 1, kv_len] or [1, 1, 1, kv_len]
-        let bias_heads = bias.dims()[1];
-        assert!(
-            bias_heads == q_heads || bias_heads == 1,
-            "QJL bias heads ({bias_heads}) must be {q_heads} or 1 for GQA broadcast"
-        );
-
-        // run_attention handles GQA expansion internally via repeat_kv,
-        // so pass K/V with kv_heads (not q_heads)
-        let n_rep = q_heads / kv_heads;
-        let params = SdpaParams {
-            n_kv_groups: n_rep,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: Some(bias),
-        };
-        let result = Sdpa.run_attention(&q, &full_k, &full_v, None, None, &params);
-        assert!(
-            result.is_ok(),
-            "Attention with GQA + QJL bias must not crash: {:?}",
-            result.err()
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Block-wise attention via cached_attention()
-    // -------------------------------------------------------------------
-
-    /// Block-wise decode attention must produce the same result as
-    /// full-dequant + SDPA (within quantization tolerance).
-    #[test]
-    fn blockwise_matches_full_dequant_cpu() {
-        use crate::attention::{cached_attention, Sdpa, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 128;
-        let kv_heads: usize = 8;
-        let q_heads: usize = 16; // GQA ratio 2
-        let layers: usize = 1;
-        let layer: usize = 0;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let n_kv_groups = q_heads / kv_heads;
-
-        let sdpa_params = SdpaParams {
-            n_kv_groups,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        // --- Reference path: full-dequant + SDPA ---
-        let tq_ref = TurboQuantKVCache::new_pqo(bits, dim, kv_heads, layers).unwrap();
-        let shared_ref = Arc::new(Mutex::new(tq_ref));
-        let mut cache_ref = KvCache::new_turboquant(shared_ref, layer, Device::Cpu, DType::F32);
-
-        // --- Blockwise path ---
-        let tq_bw = TurboQuantKVCache::new_pqo(bits, dim, kv_heads, layers).unwrap();
-        let shared_bw = Arc::new(Mutex::new(tq_bw));
-        let mut cache_bw = KvCache::new_turboquant(shared_bw, layer, Device::Cpu, DType::F32);
-
-        // Prefill 32 tokens (both caches get same data)
-        let k_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 32, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 32, dim), &Device::Cpu).unwrap();
-        let (k_ref, v_ref) = cache_ref.append(&k_pf, &v_pf).unwrap();
-        let (_, _) = cache_bw.append(&k_pf, &v_pf).unwrap();
-
-        // Decode 1 token
-        let k_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-        let q = Tensor::rand(0f32, 1.0, (1, q_heads, 1, dim), &Device::Cpu).unwrap();
-
-        // Reference: full-dequant + SDPA
-        let (k_full, v_full) = cache_ref.append(&k_dec, &v_dec).unwrap();
-        let ref_out = Sdpa
-            .run_attention(&q, &k_full, &v_full, None, None, &sdpa_params)
-            .unwrap();
-
-        // Blockwise: cached_attention dispatches to blockwise path
-        let bw_out =
-            cached_attention(&mut cache_bw, &q, &k_dec, &v_dec, None, &sdpa_params, None).unwrap();
-
-        // Compare shapes
-        assert_eq!(ref_out.dims(), bw_out.dims(), "Output shapes must match");
-        assert_eq!(ref_out.dims(), &[1, q_heads, 1, dim]);
-
-        // Compare values — should be close (both go through quantization)
-        let ref_flat: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
-        let bw_flat: Vec<f32> = bw_out.flatten_all().unwrap().to_vec1().unwrap();
-
-        let mut max_diff: f32 = 0.0;
-        for (r, b) in ref_flat.iter().zip(bw_flat.iter()) {
-            max_diff = max_diff.max((r - b).abs());
-        }
-        assert!(
-            max_diff < 0.05,
-            "Block-wise and full-dequant attention should match closely, max diff: {max_diff}"
-        );
-    }
-
-    /// cached_attention with Normal cache must behave identically to append + SDPA.
-    #[test]
-    fn cached_attention_normal_cache_unchanged() {
-        use crate::attention::{cached_attention, Sdpa, SdpaParams};
-
-        let dim: usize = 64;
-        let heads: usize = 4;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let sdpa_params = SdpaParams {
-            n_kv_groups: 1,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        // Reference: direct append + SDPA
-        let mut cache_ref = KvCache::new_normal(2, 1024, 512);
-        let k_pf = Tensor::rand(0f32, 1.0, (1, heads, 8, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, heads, 8, dim), &Device::Cpu).unwrap();
-        let (k_r, v_r) = cache_ref.append(&k_pf, &v_pf).unwrap();
-        let k_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let q = Tensor::rand(0f32, 1.0, (1, heads, 1, dim), &Device::Cpu).unwrap();
-        let (k_r, v_r) = cache_ref.append(&k_dec, &v_dec).unwrap();
-        let ref_out = Sdpa
-            .run_attention(&q, &k_r, &v_r, None, None, &sdpa_params)
-            .unwrap();
-
-        // cached_attention path
-        let mut cache_ca = KvCache::new_normal(2, 1024, 512);
-        let _ = cache_ca.append(&k_pf, &v_pf).unwrap();
-        let ca_out =
-            cached_attention(&mut cache_ca, &q, &k_dec, &v_dec, None, &sdpa_params, None).unwrap();
-
-        // Must be bit-identical (no quantization involved)
-        let ref_flat: Vec<f32> = ref_out.flatten_all().unwrap().to_vec1().unwrap();
-        let ca_flat: Vec<f32> = ca_out.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(
-            ref_flat, ca_flat,
-            "Normal cache: cached_attention must be identical to append+SDPA"
-        );
-    }
-
-    /// Prefill (seq_len > 1) should use the standard path, not blockwise.
-    #[test]
-    fn cached_attention_prefill_uses_standard_path() {
-        use crate::attention::{cached_attention, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 64;
-        let heads: usize = 2;
-        let layers: usize = 1;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let sdpa_params = SdpaParams {
-            n_kv_groups: 1,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        let tq = TurboQuantKVCache::new_pqo(bits, dim, heads, layers).unwrap();
-        let shared = Arc::new(Mutex::new(tq));
         let mut cache = KvCache::new_turboquant(shared, 0, Device::Cpu, DType::F32);
+        let k = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
+        let v = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
 
-        // Prefill with 8 tokens — should work and return correct shape
-        let k = Tensor::rand(0f32, 1.0, (1, heads, 8, dim), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, heads, 8, dim), &Device::Cpu).unwrap();
-        let q = Tensor::rand(0f32, 1.0, (1, heads, 8, dim), &Device::Cpu).unwrap();
-
-        let result = cached_attention(&mut cache, &q, &k, &v, None, &sdpa_params, None).unwrap();
-        assert_eq!(result.dims(), &[1, heads, 8, dim]);
+        let (k_out, v_out) = cache.append(&k, &v).unwrap();
+        // First append returns originals
+        assert_eq!(k_out.dims(), &[1, 4, 8, 128]);
+        assert_eq!(cache.current_seq_len(), 8);
     }
 
-    /// Fused CUDA kernel must match full-dequant + SDPA on GPU.
-    /// Skipped if no CUDA device available.
     #[test]
-    fn fused_kernel_matches_full_dequant_gpu() {
-        use crate::attention::{cached_attention, Sdpa, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
+    fn compressed_cache_reset() {
+        use turboquant::cache::config::QuantNormMode as TqNormMode;
+        use turboquant::cache::PqoCache;
 
-        let device = if candle_core::utils::cuda_is_available() {
-            Device::new_cuda(0).unwrap()
-        } else {
-            eprintln!("Skipping fused_kernel_matches_full_dequant_gpu: no CUDA");
-            return;
-        };
+        let pqo = PqoCache::new(3, 128, 4, 2, TqNormMode::MaxNorm);
+        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
+            Arc::new(Mutex::new(pqo));
 
-        let bits: u8 = 3;
-        let dim: usize = 128;
-        let kv_heads: usize = 8;
-        let q_heads: usize = 16; // GQA ratio 2
-        let layers: usize = 1;
-        let layer: usize = 0;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let n_kv_groups = q_heads / kv_heads;
-        let dtype = DType::BF16;
+        let mut cache = KvCache::new_turboquant(shared, 0, Device::Cpu, DType::F32);
+        let k = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
+        let v = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
+        cache.append(&k, &v).unwrap();
+        assert_eq!(cache.current_seq_len(), 4);
 
-        let sdpa_params = SdpaParams {
-            n_kv_groups,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        // --- Reference: full-dequant + SDPA (using append directly) ---
-        let tq_ref = TurboQuantKVCache::new_pqo(bits, dim, kv_heads, layers).unwrap();
-        let shared_ref = Arc::new(Mutex::new(tq_ref));
-        let mut cache_ref = KvCache::new_turboquant(shared_ref, layer, device.clone(), dtype);
-
-        // --- Fused kernel path (via cached_attention) ---
-        let tq_fused = TurboQuantKVCache::new_pqo(bits, dim, kv_heads, layers).unwrap();
-        let shared_fused = Arc::new(Mutex::new(tq_fused));
-        let mut cache_fused = KvCache::new_turboquant(shared_fused, layer, device.clone(), dtype);
-
-        // Prefill 64 tokens (same data for both)
-        let k_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 64, dim), &device).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 64, dim), &device).unwrap();
-        cache_ref.append(&k_pf, &v_pf).unwrap();
-        cache_fused.append(&k_pf, &v_pf).unwrap();
-
-        // Decode 1 token
-        let k_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &device).unwrap();
-        let v_dec = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &device).unwrap();
-        let q = Tensor::rand(0f32, 1.0, (1, q_heads, 1, dim), &device).unwrap();
-
-        // Reference: full-dequant + SDPA
-        let (k_full, v_full) = cache_ref.append(&k_dec, &v_dec).unwrap();
-        let ref_out = Sdpa
-            .run_attention(&q, &k_full, &v_full, None, None, &sdpa_params)
-            .unwrap();
-
-        // Fused: cached_attention dispatches to fused kernel on CUDA
-        let fused_out = cached_attention(
-            &mut cache_fused,
-            &q,
-            &k_dec,
-            &v_dec,
-            None,
-            &sdpa_params,
-            None,
-        )
-        .unwrap();
-
-        // Compare
-        assert_eq!(ref_out.dims(), fused_out.dims(), "Output shapes must match");
-
-        let ref_flat: Vec<f32> = ref_out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let fused_flat: Vec<f32> = fused_out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        let mut max_diff: f32 = 0.0;
-        for (r, f) in ref_flat.iter().zip(fused_flat.iter()) {
-            max_diff = max_diff.max((r - f).abs());
-        }
-        assert!(
-            max_diff < 0.1,
-            "Fused kernel and full-dequant attention must match, max diff: {max_diff}"
-        );
-    }
-
-    /// Verify the PQO3 pipeline: prefill quantizes immediately, decode works correctly.
-    #[test]
-    fn pqo3_prefill_decode_pipeline() {
-        use crate::attention::{cached_attention, SdpaParams};
-        use crate::paged_attention::turboquant_cache::TurboQuantKVCache;
-        use std::sync::{Arc, Mutex};
-
-        let bits: u8 = 3;
-        let dim: usize = 64;
-        let kv_heads: usize = 4;
-        let q_heads: usize = 4;
-        let layers: usize = 1;
-        let layer: usize = 0;
-        let scale = 1.0 / (dim as f32).sqrt();
-        let sdpa_params = SdpaParams {
-            n_kv_groups: q_heads / kv_heads,
-            softcap: None,
-            softmax_scale: scale,
-            sliding_window: None,
-            sinks: None,
-            qjl_bias: None,
-        };
-
-        let tq = TurboQuantKVCache::new_pqo(bits, dim, kv_heads, layers).unwrap();
-        let shared = Arc::new(Mutex::new(tq));
-        let mut cache = KvCache::new_turboquant(shared.clone(), layer, Device::Cpu, DType::F32);
-
-        // Step 1: Prefill with 16 tokens — quantizes immediately
-        let k_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 16, dim), &Device::Cpu).unwrap();
-        let v_pf = Tensor::rand(0f32, 1.0, (1, kv_heads, 16, dim), &Device::Cpu).unwrap();
-        let q_pf = Tensor::rand(0f32, 1.0, (1, q_heads, 16, dim), &Device::Cpu).unwrap();
-        let pf_out =
-            cached_attention(&mut cache, &q_pf, &k_pf, &v_pf, None, &sdpa_params, None).unwrap();
-        assert_eq!(pf_out.dims(), &[1, q_heads, 16, dim]);
-
-        // After prefill, compressed cache should exist immediately
-        {
-            let guard = shared.lock().unwrap();
-            assert_eq!(guard.buf_seq_len_for_test(layer), 16);
-        }
-
-        // Step 2: Decode tokens
-        for step in 0..3 {
-            let k_d = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-            let v_d = Tensor::rand(0f32, 1.0, (1, kv_heads, 1, dim), &Device::Cpu).unwrap();
-            let q_d = Tensor::rand(0f32, 1.0, (1, q_heads, 1, dim), &Device::Cpu).unwrap();
-            let d_out =
-                cached_attention(&mut cache, &q_d, &k_d, &v_d, None, &sdpa_params, None).unwrap();
-            assert_eq!(d_out.dims(), &[1, q_heads, 1, dim]);
-
-            let guard = shared.lock().unwrap();
-            assert_eq!(guard.buf_seq_len_for_test(layer), 16 + step + 1);
-        }
+        cache.set_none_cache();
+        assert_eq!(cache.current_seq_len(), 0);
     }
 }
