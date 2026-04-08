@@ -1,6 +1,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use crate::{attention::backends::cpu, pipeline::text_models_inputs_processor::FlashParams};
+use crate::{
+    attention::backends::cpu, kv_cache::KvCache,
+    pipeline::text_models_inputs_processor::FlashParams,
+};
 
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -21,13 +24,13 @@ pub(crate) fn chunked_attention<F>(
     attention_fn: F,
 ) -> Result<Tensor>
 where
-    F: Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>) -> Result<Tensor>,
+    F: Fn(&Tensor, &Tensor, &Tensor, Option<&Tensor>, usize, usize) -> Result<Tensor>,
 {
     let seq_len = q.dim(2)?;
 
     if seq_len <= ATTENTION_CHUNK_SIZE {
-        // For short sequences, use the regular path
-        return attention_fn(q, k, v, mask);
+        // For short sequences, use the regular path (offset=0, len=seq_len)
+        return attention_fn(q, k, v, mask, 0, seq_len);
     }
 
     // Chunk the query to avoid OOM on long sequences
@@ -41,29 +44,26 @@ where
         // Extract query chunk
         let q_chunk = q.narrow(2, offset, chunk_len)?;
 
-        // Extract mask chunk if present
+        // Extract mask chunk if present.
+        // Small broadcast masks (e.g. [1,1]) are passed through unchanged.
         let mask_chunk = mask
             .map(|m| {
-                match m.rank() {
-                    2 => {
-                        // For 2D masks (seq_len, seq_len), narrow along dimension 0
-                        m.narrow(0, offset, chunk_len)
-                    }
-                    3 => {
-                        // For 3D masks (batch, seq_len, seq_len), narrow along dimension 1
-                        m.narrow(1, offset, chunk_len)
-                    }
-                    4 => {
-                        // For 4D masks (batch, heads, seq_len, seq_len), narrow along dimension 2
-                        m.narrow(2, offset, chunk_len)
-                    }
-                    _ => m.narrow(2, offset, chunk_len), // Default to dimension 2
+                let narrow_dim = match m.rank() {
+                    2 => 0,
+                    3 => 1,
+                    _ => 2,
+                };
+                if m.dim(narrow_dim)? >= offset + chunk_len {
+                    m.narrow(narrow_dim, offset, chunk_len)
+                } else {
+                    // Mask is smaller than chunk (broadcast mask) — pass through
+                    Ok(m.clone())
                 }
             })
             .transpose()?;
 
         // Compute attention for this chunk
-        let att_chunk = attention_fn(&q_chunk, k, v, mask_chunk.as_ref())?;
+        let att_chunk = attention_fn(&q_chunk, k, v, mask_chunk.as_ref(), offset, chunk_len)?;
 
         attn_chunks.push(att_chunk);
     }
@@ -87,6 +87,30 @@ pub struct SdpaParams {
     pub softmax_scale: f32,
     pub sliding_window: Option<usize>,
     pub sinks: Option<Tensor>,
+    /// QJL bias correction for TurboQuant attention (Paper Algorithm 2).
+    /// Shape: `[batch, num_heads_or_1, q_len, kv_len]`.
+    /// Added to attention logits before softmax. `None` for non-TurboQuant.
+    pub qjl_bias: Option<Tensor>,
+}
+
+impl SdpaParams {
+    /// Returns a new `SdpaParams` with the QJL bias set, keeping all other fields.
+    ///
+    /// Use in model attention layers:
+    /// ```ignore
+    /// let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
+    /// Sdpa.run_attention(&q, &k, &v, mask, flash_params, &sdpa_params)?
+    /// ```
+    pub fn with_qjl(&self, qjl_bias: Option<Tensor>) -> Self {
+        Self {
+            n_kv_groups: self.n_kv_groups,
+            softcap: self.softcap,
+            softmax_scale: self.softmax_scale,
+            sliding_window: self.sliding_window,
+            sinks: self.sinks.clone(),
+            qjl_bias,
+        }
+    }
 }
 
 pub struct Sdpa;
@@ -122,8 +146,11 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
-        let can_use_flash = q.device().is_cpu()
-            || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32;
+        // QJL bias correction requires naive SDPA — flash attention kernels
+        // cannot inject a custom additive bias on attention logits.
+        let can_use_flash = sdpa_params.qjl_bias.is_none()
+            && (q.device().is_cpu()
+                || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32);
 
         if can_use_flash {
             // flash-attn expects (b_sz, seq_len, nheads, head_dim)
@@ -223,6 +250,17 @@ impl Sdpa {
             );
         }
 
+        // QJL bias requires naive SDPA — cuBLASLt path doesn't support additive bias.
+        if sdpa_params.qjl_bias.is_some() {
+            return naive_sdpa(
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                mask,
+                sdpa_params,
+            );
+        }
+
         // TODO: bench?
         #[allow(unused)]
         if let (Device::Cuda(_), Some(cublaslt)) = (
@@ -237,65 +275,76 @@ impl Sdpa {
                 let k_flat = k.flatten(0, 1)?;
                 let v_flat = v.flatten(0, 1)?;
 
-                chunked_attention(q, &k, &v, mask, |q_chunk, _k, _v, mask_chunk| {
-                    // cuBLASLt batch matmul implementation requires inputs to be dims3
-                    let (chunk_b_sz, chunk_n_heads, chunk_seq_len, chunk_head_dim) =
-                        q_chunk.dims4()?;
-                    let q_flat = q_chunk.flatten(0, 1)?;
+                chunked_attention(
+                    q,
+                    &k,
+                    &v,
+                    mask,
+                    |q_chunk, _k, _v, mask_chunk, _offset, _len| {
+                        // cuBLASLt batch matmul implementation requires inputs to be dims3
+                        let (chunk_b_sz, chunk_n_heads, chunk_seq_len, chunk_head_dim) =
+                            q_chunk.dims4()?;
+                        let q_flat = q_chunk.flatten(0, 1)?;
 
-                    let attention_bias = match mask_chunk {
-                        Some(mask) if mask.rank() == 3 && mask.dims()[0] == 1 => {
-                            Some(mask.repeat((chunk_n_heads, 1, 1))?)
+                        let attention_bias = match mask_chunk {
+                            Some(mask) if mask.rank() == 3 && mask.dims()[0] == 1 => {
+                                Some(mask.repeat((chunk_n_heads, 1, 1))?)
+                            }
+                            Some(mask) if mask.rank() == 3 => Some(mask.clone()),
+                            Some(mask) if mask.rank() == 4 => {
+                                let tgt_shape =
+                                    vec![chunk_b_sz, chunk_n_heads, chunk_seq_len, k.dim(2)?];
+                                Some(mask.broadcast_as(tgt_shape)?.flatten(0, 1)?)
+                            }
+                            Some(mask) => {
+                                candle_core::bail!("cublaslt attn mask: rank must be 3 or 4")
+                            }
+                            None => None,
+                        };
+
+                        // If attention_bias is set, we fuse the add by giving it as the output matrix
+                        // and setting beta to 1.0
+                        let beta = match attention_bias.is_some() {
+                            true => Some(1.0),
+                            false => None,
+                        };
+
+                        // Batch matrix multiplication
+                        // Fuse softmax scale and attention_bias add
+                        let mut attention_scores = cublaslt.batch_matmul(
+                            &k_flat,
+                            &q_flat,
+                            attention_bias.as_ref(),
+                            Some(sdpa_params.softmax_scale / sdpa_params.softcap.unwrap_or(1.0)),
+                            beta,
+                            None,
+                            None,
+                        )?;
+                        if let Some(softcap) = sdpa_params.softcap {
+                            attention_scores = (attention_scores.tanh()? * softcap as f64)?;
                         }
-                        Some(mask) if mask.rank() == 3 => Some(mask.clone()),
-                        Some(mask) if mask.rank() == 4 => {
-                            let tgt_shape =
-                                vec![chunk_b_sz, chunk_n_heads, chunk_seq_len, k.dim(2)?];
-                            Some(mask.broadcast_as(tgt_shape)?.flatten(0, 1)?)
-                        }
-                        Some(mask) => {
-                            candle_core::bail!("cublaslt attn mask: rank must be 3 or 4")
-                        }
-                        None => None,
-                    };
+                        attention_scores = candle_nn::ops::softmax_last_dim(&attention_scores)?;
 
-                    // If attention_bias is set, we fuse the add by giving it as the output matrix
-                    // and setting beta to 1.0
-                    let beta = match attention_bias.is_some() {
-                        true => Some(1.0),
-                        false => None,
-                    };
+                        let context_layer = cublaslt.batch_matmul(
+                            &v_flat.t()?.contiguous()?,
+                            &attention_scores,
+                            // We save one allocation
+                            Some(&q_flat),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )?;
 
-                    // Batch matrix multiplication
-                    // Fuse softmax scale and attention_bias add
-                    let mut attention_scores = cublaslt.batch_matmul(
-                        &k_flat,
-                        &q_flat,
-                        attention_bias.as_ref(),
-                        Some(sdpa_params.softmax_scale / sdpa_params.softcap.unwrap_or(1.0)),
-                        beta,
-                        None,
-                        None,
-                    )?;
-                    if let Some(softcap) = sdpa_params.softcap {
-                        attention_scores = (attention_scores.tanh()? * softcap as f64)?;
-                    }
-                    attention_scores = candle_nn::ops::softmax_last_dim(&attention_scores)?;
-
-                    let context_layer = cublaslt.batch_matmul(
-                        &v_flat.t()?.contiguous()?,
-                        &attention_scores,
-                        // We save one allocation
-                        Some(&q_flat),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-
-                    // Reshape to dims4
-                    context_layer.reshape((chunk_b_sz, chunk_n_heads, chunk_seq_len, v_head_dim))
-                })
+                        // Reshape to dims4
+                        context_layer.reshape((
+                            chunk_b_sz,
+                            chunk_n_heads,
+                            chunk_seq_len,
+                            v_head_dim,
+                        ))
+                    },
+                )
             }
             #[cfg(not(feature = "cuda"))]
             {
@@ -305,4 +354,56 @@ impl Sdpa {
             naive_sdpa(q, &k, &v, mask, sdpa_params)
         }
     }
+}
+
+/// Append K/V to cache and compute attention in one step.
+///
+/// For TurboQuant decode (single-token generation with existing cache):
+/// uses block-wise attention directly from compressed data — no full
+/// dequantization, O(block_size) memory instead of O(seq_len).
+///
+/// For everything else (Normal, Rotating, TurboQuant prefill):
+/// delegates to the standard `append()` + `Sdpa.run_attention()` path.
+///
+/// This function is the single integration point for all models — changing
+/// the attention strategy here affects all 28+ model implementations.
+pub fn cached_attention(
+    kv_cache: &mut KvCache,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    sdpa_params: &SdpaParams,
+    flash_params: Option<&FlashParams>,
+) -> Result<Tensor> {
+    // TurboQuant: blockwise decode on CUDA (saves VRAM), full-dequant on CPU/Metal
+    // (CPU/Metal have optimized flash attention that beats our generic online softmax)
+    let is_decode = k.dim(2)? == 1;
+    if let KvCache::TurboQuant { cache, layer, .. } = kv_cache {
+        let mut guard = cache
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("TurboQuant lock: {e}")))?;
+        if is_decode && guard.is_decode_ready(*layer) && k.device().is_cuda() {
+            return guard.append_and_blockwise_attend(
+                *layer,
+                k,
+                v,
+                q,
+                sdpa_params.softmax_scale,
+                sdpa_params.n_kv_groups,
+            );
+        }
+        // CPU/Metal decode, prefill, or first token: full-dequant + SDPA
+        let (k_out, v_out) = guard.append_and_dequantize(*layer, k, v)?;
+        drop(guard); // release lock before qjl_bias (which re-locks)
+        let qjl_bias = kv_cache.qjl_bias(q)?;
+        let sdpa_params = sdpa_params.with_qjl(qjl_bias);
+        return Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, &sdpa_params);
+    }
+
+    // Normal / Rotating cache: standard path
+    let (k_out, v_out) = kv_cache.append(k, v)?;
+    let qjl_bias = kv_cache.qjl_bias(q)?;
+    let sdpa_params = sdpa_params.with_qjl(qjl_bias);
+    Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, &sdpa_params)
 }

@@ -643,6 +643,7 @@ impl MultiQueryAttention2d {
             softmax_scale: self.scale as f32,
             sliding_window: None,
             sinks: None,
+            qjl_bias: None,
         };
         let mut o = Sdpa.run_attention_noflash(&q, &k, &v, None, &sdpa_params)?;
 

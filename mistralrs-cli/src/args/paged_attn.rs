@@ -3,7 +3,7 @@
 //! Unified design replacing the confusing 5-flag system with clear semantics.
 
 use clap::{Args, ValueEnum};
-use mistralrs_core::PagedCacheType;
+use mistralrs_core::{PagedCacheType, QuantNormMode};
 use serde::Deserialize;
 
 /// Cache and attention configuration
@@ -41,10 +41,16 @@ pub struct PagedAttentionOptions {
     #[arg(long = "pa-block-size")]
     pub block_size: Option<usize>,
 
-    /// KV cache quantization type
+    /// KV cache quantization type: pq3, pq4 (PolarQuant plain), pqo3, pqo4 (PolarQuant Outlier),
+    /// tq3, tq4 (TurboQuant with QJL)
     #[arg(long = "pa-cache-type", default_value = "auto", value_parser = parse_cache_type)]
     #[serde(default)]
     pub cache_type: PagedCacheType,
+
+    /// Normalization mode for quantized KV cache: maxnorm (llama.cpp, default) or l2norm (Paper)
+    #[arg(long = "pa-norm-mode", default_value = "maxnorm", value_parser = parse_norm_mode)]
+    #[serde(default)]
+    pub norm_mode: QuantNormMode,
 }
 
 impl Default for PagedAttentionOptions {
@@ -56,6 +62,7 @@ impl Default for PagedAttentionOptions {
             memory_fraction: None,
             block_size: None,
             cache_type: PagedCacheType::Auto,
+            norm_mode: QuantNormMode::MaxNorm,
         }
     }
 }
@@ -89,11 +96,16 @@ impl PagedAttentionOptions {
             self.context_len,
             self.block_size,
             self.cache_type,
+            self.norm_mode,
         )
     }
 }
 
 fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
+    s.parse()
+}
+
+fn parse_norm_mode(s: &str) -> Result<QuantNormMode, String> {
     s.parse()
 }
 
@@ -105,4 +117,5 @@ pub type PagedAttnBuilderFlags = (
     Option<usize>,  // context_len
     Option<usize>,  // block_size
     PagedCacheType, // cache_type
+    QuantNormMode,  // norm_mode
 );

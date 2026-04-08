@@ -165,6 +165,7 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -345,7 +346,13 @@ impl Model {
                 quant_cfg.get_bits_name(&vb_m)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_)) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected AttentionImplementation::Eager");
         }
 

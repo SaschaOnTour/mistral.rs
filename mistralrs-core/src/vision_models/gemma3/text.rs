@@ -144,6 +144,7 @@ impl Attention {
                 softmax_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
                 sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
             q_norm,
             k_norm,
@@ -248,11 +249,10 @@ impl Attention {
             },
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
                 match flash_params {
-                    Some(fp) => {
-                        Sdpa.run_attention(&q, &k, &v, mask, Some(fp), &self.sdpa_params)?
-                    }
-                    None => Sdpa.run_attention_noflash(&q, &k, &v, mask, &self.sdpa_params)?,
+                    Some(fp) => Sdpa.run_attention(&q, &k, &v, mask, Some(fp), &sdpa_params)?,
+                    None => Sdpa.run_attention_noflash(&q, &k, &v, mask, &sdpa_params)?,
                 }
             }
         };
@@ -476,7 +476,10 @@ impl TextModel {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(cfg.head_dim, device, None)?)
                 }
@@ -517,7 +520,12 @@ impl TextModel {
                 None,
             ))?
         };
-        let cache = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             EitherCache::Normal(NormalCache::new_for_attention(
                 &attention_mechanism,
                 cfg.num_hidden_layers,

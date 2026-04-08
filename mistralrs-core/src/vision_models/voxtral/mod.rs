@@ -105,6 +105,7 @@ impl DecoderAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -155,14 +156,9 @@ impl DecoderAttention {
 
         let (k, v) = kv_cache.append(&k, &v)?;
 
-        let mut attn_output = Sdpa.run_attention(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            Some(flash_params),
-            &self.sdpa_params,
-        )?;
+        let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
+        let mut attn_output =
+            Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?;
 
         if let Some(t) = self.wq.quantized_act_type() {
             attn_output = attn_output.to_dtype(t)?;

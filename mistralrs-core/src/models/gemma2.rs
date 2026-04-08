@@ -162,6 +162,7 @@ impl Attention {
                 softmax_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
                 sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -255,7 +256,8 @@ impl Attention {
                 // self.sliding_window is None if !self.use_sliding_window
                 let (k, v) = kv_cache.append(&k, &v)?;
 
-                Sdpa.run_attention(&q, &k, &v, mask, Some(flash_params), &self.sdpa_params)?
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
+                Sdpa.run_attention(&q, &k, &v, mask, Some(flash_params), &sdpa_params)?
             }
         };
 
@@ -448,7 +450,10 @@ impl Model {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(cfg.head_dim, device, None)?)
                 }

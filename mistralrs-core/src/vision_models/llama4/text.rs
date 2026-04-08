@@ -133,6 +133,7 @@ impl CausalSelfAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
+                qjl_bias: None,
             },
             norm,
             use_rope,
@@ -225,13 +226,14 @@ impl CausalSelfAttention {
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
 
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
                 Sdpa.run_attention(
                     &q.contiguous()?,
                     &k.contiguous()?,
                     &v.contiguous()?,
                     attention_mask.clone().as_ref(),
                     Some(flash_params),
-                    &self.sdpa_params,
+                    &sdpa_params,
                 )?
             }
         };
@@ -612,7 +614,10 @@ impl TextModel {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }

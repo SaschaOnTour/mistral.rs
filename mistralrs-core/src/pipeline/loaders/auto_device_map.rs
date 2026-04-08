@@ -223,6 +223,12 @@ pub fn get_device_layers(
 
     let model_cfg = loader.model_config(config)?;
     let kv_cache_elems = match paged_attn_config {
+        Some(cfg) if cfg.cache_type.is_turboquant() => {
+            // TurboQuant manages its own cache — no paged attention blocks needed.
+            // Estimate KV cache size as zero for device mapping purposes;
+            // TurboQuant allocates dynamically during inference.
+            0
+        }
         Some(cfg) => {
             // For MbAmount, clamp to available memory so the capacity check
             // below stays consistent. Utilization and ContextSize pass through

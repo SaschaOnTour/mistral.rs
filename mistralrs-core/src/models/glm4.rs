@@ -211,6 +211,7 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -298,14 +299,8 @@ impl Attention {
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
 
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
+                Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?
             }
         };
 
@@ -522,7 +517,10 @@ impl Model {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
@@ -561,7 +559,12 @@ impl Model {
                 None,
             ))?
         };
-        let cache = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             EitherCache::Normal(NormalCache::new_for_attention(
                 &attention_mechanism,
                 cfg.num_hidden_layers,

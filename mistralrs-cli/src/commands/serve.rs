@@ -37,6 +37,7 @@ pub async fn run_server(
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
+        paged_norm_mode,
     ) = extract_paged_attn_settings(&model_type);
 
     // Extract device settings
@@ -76,7 +77,8 @@ pub async fn run_server(
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type(paged_cache_type)
+        .with_paged_attn_norm_mode(paged_norm_mode);
 
     if let Some(model) = runtime.search_embedding_model {
         builder = builder.with_search_embedding_model(model.into());
@@ -515,7 +517,17 @@ pub(crate) fn extract_paged_attn_settings(
         ModelType::Text { cache, .. } => cache,
         ModelType::Vision { cache, .. } => cache,
         ModelType::Embedding { cache, .. } => cache,
-        _ => return (None, None, None, None, None, PagedCacheType::Auto),
+        _ => {
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                PagedCacheType::Auto,
+                mistralrs_core::QuantNormMode::MaxNorm,
+            )
+        }
     };
 
     cache.paged_attn.clone().into_builder_flags()

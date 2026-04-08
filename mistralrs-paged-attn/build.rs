@@ -20,6 +20,10 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
     println!("cargo:rerun-if-changed=src/cuda/flash_attn_sinks.cu");
+    println!("cargo:rerun-if-changed=src/cuda/tq_common.h");
+    println!("cargo:rerun-if-changed=src/cuda/tq_dequant_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/tq_quant_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/tq_attention_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/cp_async.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/exception.h");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/fastdiv.cuh");

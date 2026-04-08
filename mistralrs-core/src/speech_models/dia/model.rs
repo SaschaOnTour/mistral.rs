@@ -104,6 +104,7 @@ impl<const CROSS_ATTN: bool> DiaAttention<CROSS_ATTN> {
                 softcap: None,
                 softmax_scale: 1.,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }

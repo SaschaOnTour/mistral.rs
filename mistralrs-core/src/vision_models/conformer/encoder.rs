@@ -120,6 +120,7 @@ impl Attention {
                 softcap: None,
                 softmax_scale: self.scale,
                 sinks: None,
+                qjl_bias: None,
             },
         )?;
 

@@ -104,7 +104,7 @@ pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
-pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
+pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType, QuantNormMode};
 pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
 pub use pipeline::{
     chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,

@@ -36,6 +36,7 @@ pub async fn run_interactive(
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
+        _paged_norm_mode,
     ) = extract_paged_attn_settings(&model_type);
     let (cpu, device_layers) = extract_device_settings(&model_type);
     let isq = extract_isq_setting(&model_type);

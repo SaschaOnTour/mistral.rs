@@ -143,6 +143,7 @@ impl MLlamaTextSelfAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
+                qjl_bias: None,
             },
             rope,
             num_heads: cfg.num_attention_heads / comm.world_size(),
@@ -365,6 +366,7 @@ impl MLlamaTextCrossAttention {
                 softmax_scale: 1.0 / (cfg.head_dim() as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -563,7 +565,13 @@ impl MLlamaTextModel {
                 quant_cfg.get_bits_name(&vb)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_)) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;

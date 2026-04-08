@@ -45,6 +45,7 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
+        _paged_norm_mode,
     ) = paged_attn.into_builder_flags();
 
     let (model_configs, cpu) = build_model_configs(&models)?;
@@ -137,6 +138,7 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
+        _paged_norm_mode,
     ) = paged_attn.into_builder_flags();
 
     let (model_configs, cpu) = build_model_configs(&models)?;

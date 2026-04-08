@@ -1356,13 +1356,14 @@ impl CausalSelfAttention {
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
 
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
                 Sdpa.run_attention(
                     &q,
                     &k,
                     &v,
                     attention_mask.clone().as_ref(),
                     Some(flash_params),
-                    &self.sdpa_params,
+                    &sdpa_params,
                 )?
             }
         };
@@ -1450,6 +1451,7 @@ impl CausalSelfAttention {
                 softmax_scale: cfg.attention_multiplier,
                 sliding_window: None,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -1815,7 +1817,10 @@ impl GraniteMoeHybrid {
                         None
                     };
                     let paged_attn = match &attention_mechanism {
-                        AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                        AttentionImplementation::Eager
+                        | AttentionImplementation::PolarQuant(_, _)
+                        | AttentionImplementation::PolarQuantOutlier(_, _)
+                        | AttentionImplementation::TurboQuant(_, _) => None,
                         AttentionImplementation::PagedAttention => {
                             Some(PagedAttention::new(head_dim, device, None)?)
                         }

@@ -158,6 +158,7 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -210,6 +211,7 @@ impl Attention {
         let mut attn_output = {
             let (k, v) = kv_cache.append(&k, &v)?;
 
+            let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
             Sdpa.run_attention(
                 &q.contiguous()?.to_dtype(DType::F32)?,
                 &k.contiguous()?.to_dtype(DType::F32)?,
@@ -218,7 +220,7 @@ impl Attention {
                     .map(|mask| mask.to_dtype(DType::F32).unwrap())
                     .as_ref(),
                 Some(flash_params),
-                &self.sdpa_params,
+                &sdpa_params,
             )?
             .to_dtype(q.dtype())?
         };
@@ -329,7 +331,13 @@ impl Qwen2VLTextModel {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
-        if !matches!(attention_mechanism, AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_)) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;

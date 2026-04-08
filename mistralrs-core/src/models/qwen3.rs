@@ -11,10 +11,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
-    attention::SdpaParams,
+    attention::{cached_attention, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
-    layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -173,6 +173,7 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
         })
     }
@@ -258,18 +259,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -463,7 +461,10 @@ impl Model {
                 .expect("No RoPE for device location!")
                 .clone();
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
@@ -502,7 +503,12 @@ impl Model {
                 None,
             ))?
         };
-        let cache = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             EitherCache::Normal(NormalCache::new_for_attention(
                 &attention_mechanism,
                 cfg.num_hidden_layers,

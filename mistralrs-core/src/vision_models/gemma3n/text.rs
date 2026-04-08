@@ -301,6 +301,7 @@ impl Attention {
                 softmax_scale: 1.0,
                 sliding_window,
                 sinks: None,
+                qjl_bias: None,
             },
             q_norm,
             k_norm,
@@ -971,7 +972,13 @@ impl TextModel {
                 quant_cfg.get_bits_name(&vb)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_)) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;
@@ -1191,7 +1198,12 @@ impl TextModel {
             )?);
         }
 
-        let cache = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             EitherCache::Normal(NormalCache::new_for_attention(
                 &attention_mechanism,
                 cfg.num_hidden_layers,

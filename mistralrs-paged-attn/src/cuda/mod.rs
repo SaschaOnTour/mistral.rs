@@ -6,5 +6,6 @@ mod ffi;
 pub use backend::{
     concat_and_cache_mla, context_attention_fwd_mla, copy_blocks, flash_attn_sinks,
     flash_attn_sinks_varlen, flashinfer_mla_decode, gather_kv_cache, gather_mla_cache,
-    kv_scale_update, paged_attention, reshape_and_cache, swap_blocks,
+    kv_scale_update, paged_attention, reshape_and_cache, swap_blocks, tq_dequant_batch,
+    tq_fused_attention, tq_pack_indices, tq_qjl_batch, tq_quant_batch, tq_quant_maxnorm_batch,
 };

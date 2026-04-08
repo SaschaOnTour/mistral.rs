@@ -72,6 +72,7 @@ pub struct PagedAttentionMetaBuilder {
     block_size: Option<usize>,
     mem_gpu: MemoryGpuConfig,
     cache_type: PagedCacheType,
+    norm_mode: QuantNormMode,
 }
 
 impl Default for PagedAttentionMetaBuilder {
@@ -80,6 +81,7 @@ impl Default for PagedAttentionMetaBuilder {
             block_size: None,
             mem_gpu: MemoryGpuConfig::ContextSize(4096),
             cache_type: PagedCacheType::Auto,
+            norm_mode: QuantNormMode::MaxNorm,
         }
     }
 }
@@ -103,9 +105,20 @@ impl PagedAttentionMetaBuilder {
         self
     }
 
+    /// Set the normalization mode. Defaults to `QuantNormMode::MaxNorm`.
+    pub fn with_norm_mode(mut self, norm_mode: QuantNormMode) -> Self {
+        self.norm_mode = norm_mode;
+        self
+    }
+
     /// Build the [`PagedAttentionConfig`]. Returns an error if the configuration is invalid.
     pub fn build(self) -> anyhow::Result<PagedAttentionConfig> {
-        PagedAttentionConfig::new(self.block_size, self.mem_gpu, self.cache_type)
+        PagedAttentionConfig::new(
+            self.block_size,
+            self.mem_gpu,
+            self.cache_type,
+            self.norm_mode,
+        )
     }
 }
 

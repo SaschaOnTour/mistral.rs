@@ -134,7 +134,8 @@ impl LayerWeights {
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
 
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
+                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
+                Sdpa.run_attention(&q, &k, &v, mask, None, &sdpa_params)?
             }
         };
 
@@ -300,7 +301,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 rms_eps,
             )?;
             let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager | AttentionImplementation::TurboQuant(_) => None,
+                AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _) => None,
                 AttentionImplementation::PagedAttention => {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
@@ -339,6 +343,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: Some(context_window),
                     sinks: None,
+                    qjl_bias: None,
                 },
                 dtype,
             })

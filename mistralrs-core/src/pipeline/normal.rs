@@ -22,7 +22,7 @@ use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{
-    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType,
+    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType, QuantNormMode,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
@@ -612,17 +612,24 @@ impl Loader for NormalLoader {
 
         let is_xlora = self.kind.is_adapted_and(|a| a.is_x_lora());
 
+        let norm_mode = paged_attn_config
+            .as_ref()
+            .map_or(QuantNormMode::MaxNorm, |c| c.norm_mode);
         let attention_mechanism = match paged_attn_config.as_ref().map(|c| c.cache_type) {
+            Some(PagedCacheType::PolarQuant(bits)) => {
+                info!("KV cache: PQ{bits} ({bits}-bit PolarQuant, standard codebook, {norm_mode})");
+                AttentionImplementation::PolarQuant(bits, norm_mode)
+            }
+            Some(PagedCacheType::PolarQuantOutlier(bits)) => {
+                info!("KV cache: PQO{bits} ({bits}-bit PolarQuant, outlier codebook, {norm_mode})");
+                AttentionImplementation::PolarQuantOutlier(bits, norm_mode)
+            }
             Some(PagedCacheType::TurboQuant(bits)) => {
-                let compression = match bits {
-                    3 => "~4.9x",
-                    4 => "~3.5x",
-                    _ => "~?x",
-                };
                 info!(
-                    "Using TurboQuant TQ{bits} KV cache quantization ({bits}-bit, {compression} compression vs FP16)"
+                    "KV cache: TQ{bits} ({}-bit PolarQuant + 1-bit QJL, {norm_mode})",
+                    bits - 1
                 );
-                AttentionImplementation::TurboQuant(bits)
+                AttentionImplementation::TurboQuant(bits, norm_mode)
             }
             Some(_) => AttentionImplementation::PagedAttention,
             None => AttentionImplementation::Eager,
@@ -953,7 +960,12 @@ impl Loader for NormalLoader {
             paged_attn_config
         };
 
-        let (cache_config, cache_engine) = if matches!(attention_mechanism, AttentionImplementation::TurboQuant(_)) {
+        let (cache_config, cache_engine) = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             // TurboQuant: skip CacheEngine (no paged attention blocks needed).
             // Models create TurboQuant KvCache directly via NormalCacheType::TurboQuant.
             (None, None)
