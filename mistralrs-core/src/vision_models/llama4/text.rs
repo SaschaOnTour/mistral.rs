@@ -133,7 +133,6 @@ impl CausalSelfAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
             norm,
             use_rope,
@@ -603,14 +602,10 @@ impl TextModel {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(i)?;
             Block::new(

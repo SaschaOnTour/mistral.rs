@@ -45,7 +45,7 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
-        _paged_norm_mode,
+        paged_norm_mode,
     ) = paged_attn.into_builder_flags();
 
     let (model_configs, cpu) = build_model_configs(&models)?;
@@ -77,7 +77,8 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type(paged_cache_type)
+        .with_paged_attn_norm_mode(paged_norm_mode);
 
     for config in model_configs {
         builder = builder.add_model_config(config);
@@ -138,7 +139,7 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
-        _paged_norm_mode,
+        paged_norm_mode,
     ) = paged_attn.into_builder_flags();
 
     let (model_configs, cpu) = build_model_configs(&models)?;
@@ -170,7 +171,8 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type(paged_cache_type)
+        .with_paged_attn_norm_mode(paged_norm_mode);
 
     for config in model_configs {
         builder = builder.add_model_config(config);

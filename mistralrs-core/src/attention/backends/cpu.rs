@@ -757,7 +757,6 @@ mod tests {
             n_kv_groups: 1,
             sliding_window: None,
             sinks: None,
-            qjl_bias: None,
         };
         let scale = sdpa.softmax_scale;
 
@@ -817,7 +816,6 @@ mod tests {
             n_kv_groups: 1,
             sliding_window: None,
             sinks: None,
-            qjl_bias: None,
         };
         let scale = sdpa.softmax_scale;
 
@@ -877,7 +875,6 @@ mod tests {
             n_kv_groups: 1,
             sliding_window: None,
             sinks: None,
-            qjl_bias: None,
         };
         let scale = sdpa.softmax_scale;
         let sc = sdpa.softcap.unwrap();
@@ -940,7 +937,6 @@ mod tests {
             n_kv_groups: 1,
             sliding_window: None,
             sinks: None,
-            qjl_bias: None,
         };
         let scale = sdpa.softmax_scale;
         let sc = sdpa.softcap.unwrap();

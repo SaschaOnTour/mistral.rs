@@ -1113,12 +1113,12 @@ fn init_cache_config(
     norm_mode: mistralrs_core::QuantNormMode,
     no_paged_attn: bool,
 ) -> Result<Option<PagedAttentionConfig>> {
-    // TurboQuant works on any device (including CPU) and doesn't need
+    // Compressed cache works on any device (including CPU) and doesn't need
     // GPU memory allocation. Create a minimal config and return early.
-    if cache_type.is_turboquant() {
+    if cache_type.is_compressed_cache() {
         return Ok(Some(PagedAttentionConfig::new(
             paged_attn_block_size,
-            MemoryGpuConfig::ContextSize(0), // Not used for TurboQuant
+            MemoryGpuConfig::ContextSize(0), // Not used for compressed cache
             cache_type,
             norm_mode,
         )?));

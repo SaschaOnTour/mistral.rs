@@ -21,12 +21,16 @@ pub(crate) fn maybe_synchronize(device: &Device) -> Result<()> {
 }
 
 /// Computes softmax(QK^T*sqrt(d_k))V
+///
+/// `logit_bias`: optional additive bias on attention logits (before softmax),
+/// used for compressed-cache bias correction.
 pub(crate) fn naive_sdpa(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
     sdpa_params: &SdpaParams,
+    logit_bias: Option<&Tensor>,
 ) -> Result<Tensor> {
     maybe_synchronize(q.device())?;
 
@@ -50,14 +54,14 @@ pub(crate) fn naive_sdpa(
                 att = att.broadcast_add(mask)?;
             }
 
-            // Paper Algorithm 2 (TurboQuant): QJL bias correction.
+            // Compressed-cache logit bias correction.
             // Narrow the bias to match the current q_chunk when using chunked attention.
-            if let Some(qjl_bias) = &sdpa_params.qjl_bias {
-                let bias_q_len = qjl_bias.dim(2)?;
+            if let Some(bias) = logit_bias {
+                let bias_q_len = bias.dim(2)?;
                 let bias_chunk = if bias_q_len > q_chunk_len {
-                    qjl_bias.narrow(2, q_offset, q_chunk_len)?
+                    bias.narrow(2, q_offset, q_chunk_len)?
                 } else {
-                    qjl_bias.clone()
+                    bias.clone()
                 };
                 att = att.broadcast_add(&bias_chunk)?;
             }

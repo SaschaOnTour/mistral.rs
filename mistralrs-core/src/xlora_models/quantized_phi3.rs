@@ -169,6 +169,7 @@ impl LayerWeights {
             attn_mask.as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
@@ -339,7 +340,6 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: Some(context_window),
                     sinks: None,
-                    qjl_bias: None,
                 },
                 dtype,
             })

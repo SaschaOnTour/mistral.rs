@@ -154,7 +154,6 @@ impl Llama4VisionAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
             head_dim,
             freqs,
@@ -215,6 +214,7 @@ impl Llama4VisionAttention {
                 attention_mask,
                 Some(&flash_params),
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?

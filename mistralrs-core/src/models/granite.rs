@@ -1441,7 +1441,6 @@ impl CausalSelfAttention {
                 softmax_scale: cfg.attention_multiplier,
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -1806,14 +1805,10 @@ impl GraniteMoeHybrid {
                     } else {
                         None
                     };
-                    let paged_attn = match &attention_mechanism {
-                        AttentionImplementation::Eager
-                        | AttentionImplementation::PolarQuant(_, _)
-                        | AttentionImplementation::PolarQuantOutlier(_, _)
-                        | AttentionImplementation::TurboQuant(_, _) => None,
-                        AttentionImplementation::PagedAttention => {
-                            Some(PagedAttention::new(head_dim, device, None)?)
-                        }
+                    let paged_attn = if attention_mechanism.is_paged_attention() {
+                        Some(PagedAttention::new(head_dim, device, None)?)
+                    } else {
+                        None
                     };
                     DecoderLayer::Attention(Block::load(
                         vb_layer,

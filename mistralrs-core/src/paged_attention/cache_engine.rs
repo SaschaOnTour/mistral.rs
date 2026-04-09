@@ -38,8 +38,8 @@ impl PagedCacheType {
         }
     }
 
-    /// Returns `true` if this cache type uses quantized KV storage (PQ, PQO, or TQ).
-    pub fn is_turboquant(&self) -> bool {
+    /// Returns `true` if this cache type uses compressed/quantized KV storage (PQ, PQO, or TQ).
+    pub fn is_compressed_cache(&self) -> bool {
         matches!(
             self,
             PagedCacheType::PolarQuant(_)
@@ -412,11 +412,11 @@ mod tests {
     }
 
     #[test]
-    fn is_turboquant_detects_tq() {
-        assert!(PagedCacheType::TurboQuant(3).is_turboquant());
-        assert!(PagedCacheType::TurboQuant(4).is_turboquant());
-        assert!(!PagedCacheType::Auto.is_turboquant());
-        assert!(!PagedCacheType::F8E4M3.is_turboquant());
+    fn is_compressed_cache_detects_quantized() {
+        assert!(PagedCacheType::TurboQuant(3).is_compressed_cache());
+        assert!(PagedCacheType::TurboQuant(4).is_compressed_cache());
+        assert!(!PagedCacheType::Auto.is_compressed_cache());
+        assert!(!PagedCacheType::F8E4M3.is_compressed_cache());
     }
 
     #[test]

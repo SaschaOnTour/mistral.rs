@@ -9,7 +9,7 @@ use mistralrs_quant::{
 use crate::{
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{self, Activation, F32RmsNorm, Qwen2VLRotaryEmbedding, Sdpa},
+    layers::{self, Activation, F32RmsNorm, Qwen2VLRotaryEmbedding},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         extract_logits, text_models_inputs_processor::FlashParams, EitherCache, IsqModel, KvCache,
@@ -158,7 +158,6 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -209,20 +208,10 @@ impl Attention {
         self.rotary_emb.forward(cos_sin, &mut q, &mut k)?;
 
         let mut attn_output = {
-            let (k, v) = kv_cache.append(&k, &v)?;
-
-            let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-            Sdpa.run_attention(
-                &q.contiguous()?.to_dtype(DType::F32)?,
-                &k.contiguous()?.to_dtype(DType::F32)?,
-                &v.contiguous()?.to_dtype(DType::F32)?,
-                attention_mask
-                    .map(|mask| mask.to_dtype(DType::F32).unwrap())
-                    .as_ref(),
-                Some(flash_params),
-                &sdpa_params,
+            crate::attention::cached_attention(
+                kv_cache, &q.contiguous()?, &k.contiguous()?, &v.contiguous()?,
+                attention_mask, &self.sdpa_params, Some(flash_params),
             )?
-            .to_dtype(q.dtype())?
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {

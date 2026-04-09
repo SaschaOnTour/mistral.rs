@@ -47,7 +47,7 @@ pub enum KvCache {
         k: RotatingCache,
         v: RotatingCache,
     },
-    TurboQuant {
+    Compressed {
         /// Shared compressed cache via CompressedKVCache trait.
         cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
         /// Which transformer layer this KvCache instance represents.
@@ -64,7 +64,7 @@ impl Clone for KvCache {
         match self {
             Self::Normal { k, v } => Self::Normal { k: k.clone(), v: v.clone() },
             Self::Rotating { k, v } => Self::Rotating { k: k.clone(), v: v.clone() },
-            Self::TurboQuant { cache, layer, device, dtype } => Self::TurboQuant {
+            Self::Compressed { cache, layer, device, dtype } => Self::Compressed {
                 cache: cache.clone(), layer: *layer, device: device.clone(), dtype: *dtype,
             },
         }
@@ -76,7 +76,7 @@ impl std::fmt::Debug for KvCache {
         match self {
             Self::Normal { .. } => write!(f, "KvCache::Normal"),
             Self::Rotating { .. } => write!(f, "KvCache::Rotating"),
-            Self::TurboQuant { layer, .. } => write!(f, "KvCache::TurboQuant(layer={layer})"),
+            Self::Compressed { layer, .. } => write!(f, "KvCache::Compressed(layer={layer})"),
         }
     }
 }
@@ -97,15 +97,15 @@ impl KvCache {
     /// Creates a new compressed KV cache for a specific layer.
     ///
     /// The `cache` is a shared `Arc<Mutex<dyn CompressedKVCache>>` that holds
-    /// compressed data for ALL layers and heads. Each `KvCache::TurboQuant`
+    /// compressed data for ALL layers and heads. Each `KvCache::Compressed`
     /// instance references it with a specific `layer` index.
-    pub fn new_turboquant(
+    pub fn new_compressed(
         cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
         layer: usize,
         device: candle_core::Device,
         dtype: candle_core::DType,
     ) -> Self {
-        Self::TurboQuant {
+        Self::Compressed {
             cache,
             layer,
             device,
@@ -117,7 +117,7 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
-            Self::TurboQuant { .. } => {
+            Self::Compressed { .. } => {
                 // Compressed cache: K not accessible as raw tensor.
                 // Use cached_attention() for attention computation.
                 Ok(None)
@@ -129,7 +129,7 @@ impl KvCache {
         match self {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
-            Self::TurboQuant { .. } => {
+            Self::Compressed { .. } => {
                 // Compressed cache: V not accessible as raw tensor.
                 Ok(None)
             }
@@ -139,15 +139,10 @@ impl KvCache {
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        // Compressed cache: append is handled by cached_attention(), not here.
-        // If called directly (legacy path), use prefill with a dummy query.
-        if let Self::TurboQuant { cache, layer, .. } = self {
-            let mut guard = cache
-                .lock()
-                .map_err(|e| candle_core::Error::Msg(format!("Compressed cache lock: {e}")))?;
-            let dummy_q = Tensor::zeros_like(&k)?;
-            let result = guard.prefill(*layer, &k, &v, &dummy_q)?;
-            return Ok((result.k, result.v));
+        if self.is_compressed() {
+            candle_core::bail!(
+                "KvCache::append() called on compressed cache — use cached_attention() instead"
+            );
         }
 
         let (out_k, out_v) = match self {
@@ -161,7 +156,7 @@ impl KvCache {
                 let out_v = vc.append(&v)?;
                 (Some(out_k), Some(out_v))
             }
-            Self::TurboQuant { .. } => unreachable!("handled above"),
+            Self::Compressed { .. } => unreachable!("handled above"),
         };
         let k = match out_k {
             None => {
@@ -169,7 +164,7 @@ impl KvCache {
                 match self {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
-                    Self::TurboQuant { .. } => unreachable!("handled above"),
+                    Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
@@ -181,7 +176,7 @@ impl KvCache {
                 match self {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
-                    Self::TurboQuant { .. } => unreachable!("handled above"),
+                    Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
@@ -194,7 +189,7 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
-            Self::TurboQuant { cache, layer, .. } => {
+            Self::Compressed { cache, layer, .. } => {
                 let guard = cache.lock().expect("Compressed cache lock poisoned");
                 guard.seq_len(*layer)
             }
@@ -211,10 +206,10 @@ impl KvCache {
                 k.reset();
                 v.reset();
             }
-            Self::TurboQuant { cache, .. } => {
-                // TurboQuant caches are append-only; the simplest reset is
+            Self::Compressed { cache, .. } => {
+                // Compressed caches are append-only; the simplest reset is
                 // to replace the shared cache with a fresh one. Because a
-                // single Arc<Mutex<TurboQuantKVCache>> is shared across all
+                // single Arc<Mutex<dyn CompressedKVCache>> is shared across all
                 // layers, resetting one layer effectively needs to recreate
                 // the whole cache. We do this by replacing the Arc contents.
                 cache
@@ -239,18 +234,13 @@ impl KvCache {
                 v.set_len(len)?;
                 Ok(())
             }
-            Self::TurboQuant { .. } => {
-                // TurboQuant is append-only; truncation is not supported.
-                // Silently accept if the requested length matches current,
-                // otherwise error.
+            Self::Compressed { .. } => {
                 let current = self.current_seq_len();
-                if len <= current {
+                if len == current {
                     Ok(())
                 } else {
                     candle_core::bail!(
-                        "TurboQuant cache: cannot extend length from {} to {}",
-                        current,
-                        len,
+                        "Compressed cache does not support resize (current={current}, requested={len})"
                     )
                 }
             }
@@ -269,9 +259,15 @@ impl KvCache {
                 v.try_set_len(len)?;
                 Ok(())
             }
-            Self::TurboQuant { .. } => {
-                // TurboQuant is append-only; accept any length <= current.
-                Ok(())
+            Self::Compressed { .. } => {
+                let current = self.current_seq_len();
+                if len == current {
+                    Ok(())
+                } else {
+                    candle_core::bail!(
+                        "Compressed cache does not support resize (current={current}, requested={len})"
+                    )
+                }
             }
         }
     }
@@ -280,35 +276,16 @@ impl KvCache {
         matches!(self, Self::Rotating { .. })
     }
 
-    pub fn is_turboquant(&self) -> bool {
-        matches!(self, Self::TurboQuant { .. })
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, Self::Compressed { .. })
     }
 
-    /// QJL bias is now handled inside the CompressedKVCache trait via DequantResult.logit_bias.
-    /// This method is kept for backward compatibility but always returns None.
-    /// The actual bias flows through cached_attention() → prefill()/decode() → DequantResult.
-    pub fn qjl_bias(&self, _query: &Tensor) -> Result<Option<Tensor>> {
-        // QJL bias is now returned via DequantResult.logit_bias in the trait.
-        // This function is no longer the QJL entry point.
-        Ok(None)
-    }
 
-    /// Clones a `TurboQuant` variant by cloning the `Arc` reference.
+    /// Returns a clone of this cache if it is a `Compressed` variant (clones the `Arc` reference).
     /// Returns `None` for `Normal` / `Rotating` variants.
-    fn clone_tq_ref(&self) -> Option<KvCache> {
-        if let Self::TurboQuant {
-            cache,
-            layer,
-            device,
-            dtype,
-        } = self
-        {
-            Some(Self::TurboQuant {
-                cache: cache.clone(),
-                layer: *layer,
-                device: device.clone(),
-                dtype: *dtype,
-            })
+    fn clone_compressed_ref(&self) -> Option<KvCache> {
+        if self.is_compressed() {
+            Some(self.clone())
         } else {
             None
         }
@@ -326,9 +303,9 @@ pub enum NormalCacheType {
     SlidingWindow {
         window: usize,
     },
-    /// TurboQuant quantized KV cache. All layers share a single
-    /// `TurboQuantKVCache` via `Arc<Mutex>`.
-    TurboQuant {
+    /// Compressed quantized KV cache. All layers share a single
+    /// `CompressedKVCache` via `Arc<Mutex>`.
+    Compressed {
         bits: u8,
         head_dim: usize,
         num_kv_heads: usize,
@@ -378,7 +355,7 @@ impl NormalCache {
 
     /// Creates the appropriate cache based on the attention mechanism.
     ///
-    /// For `TurboQuant`: creates a shared quantized KV cache across all layers.
+    /// For compressed caches: creates a shared quantized KV cache across all layers.
     /// For `Eager`/`PagedAttention`: delegates to `new_sliding`.
     pub fn new_for_attention(
         attention_mechanism: &crate::paged_attention::AttentionImplementation,
@@ -438,8 +415,8 @@ impl NormalCache {
                 NormalCacheType::SlidingWindow { window } => {
                     caches.push(KvCache::new_rotating(2, window, Self::CACHE_GROW_SIZE));
                 }
-                NormalCacheType::TurboQuant { .. } => {
-                    panic!("Use NormalCache::new_for_attention() for TurboQuant caches")
+                NormalCacheType::Compressed { .. } => {
+                    panic!("Use NormalCache::new_for_attention() for compressed caches")
                 }
             }
         }
@@ -456,15 +433,8 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
-        let tq_norm = match norm_mode {
-            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
-            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
-        };
-        // PQ: outlier_blocks=0 (standard codebook for all blocks)
-        let cache = turboquant::cache::PqoCache::with_outlier_blocks(
-            bits, head_dim, num_kv_heads, num_layers, tq_norm, 0,
-        );
+        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cache = turboquant::cache::PqoCache::new(cfg);
         Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
 
@@ -478,22 +448,12 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
-        let tq_norm = match norm_mode {
-            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
-            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
-        };
-        let pqo = turboquant::cache::PqoCache::new(bits, head_dim, num_kv_heads, num_layers, tq_norm);
-        Self::new_compressed_cache(
-            pqo,
-            num_layers,
-            device,
-            dtype,
-        )
+        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, usize::MAX);
+        let pqo = turboquant::cache::PqoCache::new(cfg);
+        Self::new_compressed_cache(pqo, num_layers, device, dtype)
     }
 
     /// TQ: TurboQuant (Paper Algorithm 2: (bits-1)-bit Polar + 1-bit QJL).
-    /// TQ: (bits-1)-bit PolarQuant + 1-bit QJL correction (Paper Algorithm 2).
     pub fn new_tq(
         num_layers: usize,
         bits: u8,
@@ -503,15 +463,23 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
-        let tq_norm = match norm_mode {
-            crate::paged_attention::QuantNormMode::MaxNorm => TqNormMode::MaxNorm,
-            crate::paged_attention::QuantNormMode::L2Norm => TqNormMode::L2Norm,
-        };
-        let cache = turboquant::cache::TqCache::new(
-            bits, head_dim, num_kv_heads, num_layers, tq_norm,
-        );
+        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cache = turboquant::cache::TqCache::new(cfg);
         Self::new_compressed_cache(cache, num_layers, device, dtype)
+    }
+
+    /// Build a compressed CacheConfig from mistral.rs parameters.
+    fn compressed_cache_config(
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        num_layers: usize,
+        norm_mode: crate::paged_attention::QuantNormMode,
+        outlier_blocks: usize,
+    ) -> turboquant::cache::CacheConfig {
+        turboquant::cache::CacheConfig {
+            bits, head_dim, num_kv_heads, num_layers, norm_mode, outlier_blocks,
+        }
     }
 
     fn new_compressed_cache(
@@ -524,7 +492,7 @@ impl NormalCache {
             Arc::new(std::sync::Mutex::new(cache_impl));
         let mut caches = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
-            caches.push(KvCache::new_turboquant(
+            caches.push(KvCache::new_compressed(
                 shared.clone(),
                 layer,
                 device.clone(),
@@ -563,8 +531,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     new_v_cache.push(None);
                     continue;
                 };
-                // TurboQuant caches are shared via Arc — skip tensor extraction.
-                if cache.is_turboquant() {
+                // Compressed caches are shared via Arc — skip tensor extraction.
+                if cache.is_compressed() {
                     new_k_cache.push(None);
                     new_v_cache.push(None);
                     continue;
@@ -576,7 +544,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
-                    KvCache::TurboQuant { .. } => {
+                    KvCache::Compressed { .. } => {
                         unreachable!("handled above")
                     }
                 }
@@ -606,8 +574,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
-                    KvCache::TurboQuant { .. } => {
-                        // TurboQuant is shared; skip tensor extraction per-sequence.
+                    KvCache::Compressed { .. } => {
+                        // Compressed cache is shared; skip tensor extraction per-sequence.
                         continue;
                     }
                 };
@@ -633,11 +601,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             // Use this for the various parameters. Assumes all seqs are from one model.
             let Some(cache_ref) = seq0_cache[layer_idx].as_ref() else {
                 // Sequence has no cache for this layer. Check if the pipeline's
-                // existing cache is TurboQuant -- if so, preserve the shared
+                // existing cache is Compressed -- if so, preserve the shared
                 // reference instead of creating a dummy Normal cache.
                 if let Some(existing) = existing_pipeline_caches.get(layer_idx) {
-                    if let Some(tq) = existing.clone_tq_ref() {
-                        caches.push(tq);
+                    if let Some(compressed) = existing.clone_compressed_ref() {
+                        caches.push(compressed);
                         continue;
                     }
                 }
@@ -711,8 +679,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         },
                     });
                 }
-                KvCache::TurboQuant { .. } => {
-                    caches.push(cache_ref.clone_tq_ref().unwrap());
+                KvCache::Compressed { .. } => {
+                    caches.push(cache_ref.clone_compressed_ref().unwrap());
                 }
             }
         }
@@ -723,11 +691,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();
 
-            // TurboQuant caches must be handled first, before the is_none
-            // check below. Even when the TQ cache is empty (just reset),
+            // Compressed caches must be handled first, before the is_none
+            // check below. Even when the compressed cache is empty (just reset),
             // we still need to store the shared Arc reference into each
-            // sequence so that clone_in_cache can find a TurboQuant entry.
-            if let Some(tq) = cache.clone_tq_ref() {
+            // sequence so that clone_in_cache can find a Compressed entry.
+            if let Some(compressed) = cache.clone_compressed_ref() {
                 for seq in seqs.iter_mut() {
                     let output_cache = if modify_draft_cache {
                         seq.normal_draft_cache()
@@ -735,7 +703,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         seq.normal_cache()
                     };
                     let seq_cache = &mut output_cache[layer];
-                    *seq_cache = Some(tq.clone());
+                    *seq_cache = Some(compressed.clone());
                 }
                 continue;
             }
@@ -752,8 +720,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::Rotating { k, v } => {
                     (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                 }
-                KvCache::TurboQuant { .. } => {
-                    unreachable!("TurboQuant handled above");
+                KvCache::Compressed { .. } => {
+                    unreachable!("Compressed cache handled above");
                 }
             };
 
@@ -817,9 +785,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             },
                         });
                     }
-                    KvCache::TurboQuant { .. } => {
-                        // TurboQuant layers are skipped via `continue` above.
-                        unreachable!("TurboQuant handled by continue above");
+                    KvCache::Compressed { .. } => {
+                        // Compressed layers are skipped via `continue` above.
+                        unreachable!("Compressed cache handled by continue above");
                     }
                 }
             }
@@ -833,8 +801,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         load_preallocated_cache: bool,
     ) {
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
+            let mut compressed_reset = false;
             for layer in pipeline.cache().normal().0.iter_mut() {
-                layer.reset();
+                if layer.is_compressed() {
+                    if !compressed_reset {
+                        layer.reset();
+                        compressed_reset = true;
+                    }
+                } else {
+                    layer.reset();
+                }
             }
             return;
         }
@@ -937,16 +913,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     };
                     *layer = cache;
                 }
-                KvCache::TurboQuant {
-                    cache: tq_cache,
-                    layer: tq_layer,
+                KvCache::Compressed {
+                    cache: compressed_cache,
+                    layer: compressed_layer,
                     ..
                 } => {
-                    // Reset the TurboQuant cache by replacing its contents
+                    // Reset the compressed cache by replacing its contents
                     // with a fresh empty cache. Since all layers share the
                     // same Arc, only reset once (on layer 0).
-                    if *tq_layer == 0 {
-                        tq_cache
+                    if *compressed_layer == 0 {
+                        compressed_cache
                             .lock()
                             .expect("Compressed cache lock poisoned")
                             .reset()
@@ -1547,35 +1523,36 @@ mod tests {
         assert_eq!(v_out.dims(), &[1, 4, 8, 64]);
     }
 
+    fn test_pqo_config() -> turboquant::cache::CacheConfig {
+        turboquant::cache::CacheConfig {
+            bits: 3, head_dim: 128, num_kv_heads: 4, num_layers: 2,
+            norm_mode: turboquant::cache::config::QuantNormMode::MaxNorm,
+            outlier_blocks: usize::MAX,
+        }
+    }
+
     #[test]
     fn compressed_cache_via_pqo_factory() {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
         use turboquant::cache::PqoCache;
 
-        let bits = 3u8;
-        let head_dim = 128;
-        let num_kv_heads = 4;
-        let num_layers = 2;
-
-        let pqo = PqoCache::new(bits, head_dim, num_kv_heads, num_layers, TqNormMode::MaxNorm);
+        let pqo = PqoCache::new(test_pqo_config());
         let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
             Arc::new(Mutex::new(pqo));
 
-        let cache = KvCache::new_turboquant(shared.clone(), 0, Device::Cpu, DType::F32);
-        assert!(cache.is_turboquant());
+        let cache = KvCache::new_compressed(shared.clone(), 0, Device::Cpu, DType::F32);
+        assert!(cache.is_compressed());
         assert_eq!(cache.current_seq_len(), 0);
     }
 
     #[test]
     fn compressed_cache_append_returns_data() {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
         use turboquant::cache::PqoCache;
 
-        let pqo = PqoCache::new(3, 128, 4, 2, TqNormMode::MaxNorm);
+        let pqo = PqoCache::new(test_pqo_config());
         let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
             Arc::new(Mutex::new(pqo));
 
-        let mut cache = KvCache::new_turboquant(shared, 0, Device::Cpu, DType::F32);
+        let mut cache = KvCache::new_compressed(shared, 0, Device::Cpu, DType::F32);
         let k = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
         let v = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
 
@@ -1587,14 +1564,13 @@ mod tests {
 
     #[test]
     fn compressed_cache_reset() {
-        use turboquant::cache::config::QuantNormMode as TqNormMode;
         use turboquant::cache::PqoCache;
 
-        let pqo = PqoCache::new(3, 128, 4, 2, TqNormMode::MaxNorm);
+        let pqo = PqoCache::new(test_pqo_config());
         let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
             Arc::new(Mutex::new(pqo));
 
-        let mut cache = KvCache::new_turboquant(shared, 0, Device::Cpu, DType::F32);
+        let mut cache = KvCache::new_compressed(shared, 0, Device::Cpu, DType::F32);
         let k = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
         let v = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
         cache.append(&k, &v).unwrap();

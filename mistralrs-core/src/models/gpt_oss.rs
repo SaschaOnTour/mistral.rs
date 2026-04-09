@@ -15,7 +15,6 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         self, embedding, CausalMasker, GptOssRotaryEmbedding, MatMul, RmsNorm, RotaryEmbedding,
-        Sdpa,
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -238,7 +237,6 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window,
                 sinks: Some(sinks),
-                qjl_bias: None,
             },
             is_sliding,
         })
@@ -320,37 +318,9 @@ impl Attention {
                 }
             },
             None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                // For sliding window layers with a wrapped RotatingCache, the
-                // returned K/V are in circular buffer order (not temporal).
-                // Reorder to temporal order so the mask columns align correctly:
-                // [past_tokens | new_tokens].
-                let (k, v) = if self.is_sliding && q_len > 1 {
-                    match &*kv_cache {
-                        KvCache::Rotating { k: kc, .. }
-                            if kc.current_seq_len >= kc.max_seq_len && kc.offset > 0 =>
-                        {
-                            let dim = 2; // (batch, heads, seq, head_dim)
-                            let offset = kc.offset;
-                            let max_len = kc.max_seq_len;
-                            let p1_k = k.narrow(dim, offset, max_len - offset)?;
-                            let p2_k = k.narrow(dim, 0, offset)?;
-                            let p1_v = v.narrow(dim, offset, max_len - offset)?;
-                            let p2_v = v.narrow(dim, 0, offset)?;
-                            (
-                                Tensor::cat(&[&p1_k, &p2_k], dim)?,
-                                Tensor::cat(&[&p1_v, &p2_v], dim)?,
-                            )
-                        }
-                        _ => (k, v),
-                    }
-                } else {
-                    (k, v)
-                };
-
-                let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-                Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?
+                crate::attention::cached_attention(
+                    kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params),
+                )?
             }
         };
 
@@ -667,14 +637,10 @@ impl Model {
                 .cloned()
                 .expect("No RoPE for device");
 
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(cfg.head_dim(), &device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(cfg.head_dim(), &device, None)?)
+            } else {
+                None
             };
 
             let comm = mapper.get_comm_for(layer_idx)?;

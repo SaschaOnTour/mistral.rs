@@ -292,7 +292,6 @@ impl Attention {
             softcap: None,
             softmax_scale: self.scale,
             sinks: None,
-            qjl_bias: None,
         };
 
         // Build FlashParams with causal=false for bidirectional vision attention.
@@ -312,6 +311,7 @@ impl Attention {
             attention_mask,
             Some(&flash_params),
             &sdpa_params,
+            None,
         )?;
 
         self.o_proj.forward(&attn_weights.transpose(1, 2)?.reshape((

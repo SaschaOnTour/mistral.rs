@@ -120,8 +120,8 @@ impl Attention {
                 softcap: None,
                 softmax_scale: self.scale,
                 sinks: None,
-                qjl_bias: None,
             },
+            None,
         )?;
 
         self.o_proj.forward(&attn_weights.transpose(1, 2)?.reshape((

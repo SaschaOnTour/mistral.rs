@@ -87,30 +87,6 @@ pub struct SdpaParams {
     pub softmax_scale: f32,
     pub sliding_window: Option<usize>,
     pub sinks: Option<Tensor>,
-    /// QJL bias correction for TurboQuant attention (Paper Algorithm 2).
-    /// Shape: `[batch, num_heads_or_1, q_len, kv_len]`.
-    /// Added to attention logits before softmax. `None` for non-TurboQuant.
-    pub qjl_bias: Option<Tensor>,
-}
-
-impl SdpaParams {
-    /// Returns a new `SdpaParams` with the QJL bias set, keeping all other fields.
-    ///
-    /// Use in model attention layers:
-    /// ```ignore
-    /// let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-    /// Sdpa.run_attention(&q, &k, &v, mask, flash_params, &sdpa_params)?
-    /// ```
-    pub fn with_qjl(&self, qjl_bias: Option<Tensor>) -> Self {
-        Self {
-            n_kv_groups: self.n_kv_groups,
-            softcap: self.softcap,
-            softmax_scale: self.softmax_scale,
-            sliding_window: self.sliding_window,
-            sinks: self.sinks.clone(),
-            qjl_bias,
-        }
-    }
 }
 
 pub struct Sdpa;
@@ -122,11 +98,13 @@ impl Sdpa {
     /// - q: (b_sz, n_attn_heads, q_len, head_dim)
     /// - k: (b_sz, n_kv_heads, q_len, head_dim)
     /// - v: (b_sz, n_kv_heads, q_len, head_dim)
+    /// - logit_bias: optional additive bias on attention logits (before softmax),
+    ///   used for compressed-cache bias correction. Shape: `[batch, num_heads_or_1, q_len, kv_len]`.
     ///
     /// The attention implementation is dispatched as follows:
     /// 1) If using flash attn (CUDA), use a flash attention V2/V3 kernel
-    /// 2) If decoding and using a Metal device, use a fused kkernel
-    /// 2) Otherwise, use the "naive" SDPA implementation (with optimized mask+softmax+scale application)
+    /// 2) If decoding and using a Metal device, use a fused kernel
+    /// 3) Otherwise, use the "naive" SDPA implementation (with optimized mask+softmax+scale application)
     #[allow(unused_variables, clippy::too_many_arguments)]
     pub fn run_attention(
         &self,
@@ -136,6 +114,7 @@ impl Sdpa {
         mask: Option<&Tensor>,
         flash_params: Option<&FlashParams>,
         sdpa_params: &SdpaParams,
+        logit_bias: Option<&Tensor>,
     ) -> Result<Tensor> {
         // If sinks are present, dispatch to the sinks backend
         if let Some(sinks) = &sdpa_params.sinks {
@@ -146,9 +125,9 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
-        // QJL bias correction requires naive SDPA — flash attention kernels
+        // Logit bias correction requires naive SDPA — flash attention kernels
         // cannot inject a custom additive bias on attention logits.
-        let can_use_flash = sdpa_params.qjl_bias.is_none()
+        let can_use_flash = logit_bias.is_none()
             && (q.device().is_cpu()
                 || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32);
 
@@ -184,7 +163,7 @@ impl Sdpa {
             }
         }
 
-        self.run_attention_noflash(q, k, v, mask, sdpa_params)
+        self.run_attention_noflash(q, k, v, mask, sdpa_params, logit_bias)
     }
 
     /// Same as `run_attention`, but no flash attention
@@ -196,6 +175,7 @@ impl Sdpa {
         v: &Tensor,
         mask: Option<&Tensor>,
         sdpa_params: &SdpaParams,
+        logit_bias: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, n_attn_heads, seq_len, head_dim) = q.dims4()?;
         let (_, _, _, k_head_dim) = k.dims4()?;
@@ -247,17 +227,19 @@ impl Sdpa {
                 &v.contiguous()?,
                 mask,
                 sdpa_params,
+                logit_bias,
             );
         }
 
-        // QJL bias requires naive SDPA — cuBLASLt path doesn't support additive bias.
-        if sdpa_params.qjl_bias.is_some() {
+        // Logit bias requires naive SDPA — cuBLASLt path doesn't support additive bias.
+        if logit_bias.is_some() {
             return naive_sdpa(
                 &q.contiguous()?,
                 &k.contiguous()?,
                 &v.contiguous()?,
                 mask,
                 sdpa_params,
+                logit_bias,
             );
         }
 
@@ -351,7 +333,7 @@ impl Sdpa {
                 candle_core::bail!("`cuda` feature is not enabled")
             }
         } else {
-            naive_sdpa(q, &k, &v, mask, sdpa_params)
+            naive_sdpa(q, &k, &v, mask, sdpa_params, logit_bias)
         }
     }
 }
@@ -378,8 +360,8 @@ pub fn cached_attention(
 ) -> Result<Tensor> {
     // Compressed cache: prefill/decode via CompressedKVCache trait.
     // The cache implementation decides internally: fused kernel vs dequant.
-    let is_decode = k.dim(2)? == 1;
-    if let KvCache::TurboQuant { cache, layer, .. } = kv_cache {
+    if let KvCache::Compressed { cache, layer, .. } = kv_cache {
+        let is_decode = k.dim(2)? == 1;
         let mut guard = cache
             .lock()
             .map_err(|e| candle_core::Error::Msg(format!("Compressed cache lock: {e}")))?;
@@ -391,20 +373,60 @@ pub fn cached_attention(
             };
             return match guard.decode(*layer, k, v, q, &config)? {
                 mistralrs_kv_cache::DecodeOutput::Fused(output) => Ok(output),
-                mistralrs_kv_cache::DecodeOutput::Dequantized(result) => {
-                    let sdpa_params = sdpa_params.with_qjl(result.logit_bias);
-                    Sdpa.run_attention(q, &result.k, &result.v, mask, flash_params, &sdpa_params)
-                }
+                mistralrs_kv_cache::DecodeOutput::Dequantized(result) => Sdpa.run_attention(
+                    q,
+                    &result.k,
+                    &result.v,
+                    mask,
+                    flash_params,
+                    sdpa_params,
+                    result.logit_bias.as_ref(),
+                ),
             };
         }
 
         // Prefill: multiple tokens
         let result = guard.prefill(*layer, k, v, q)?;
-        let sdpa_params = sdpa_params.with_qjl(result.logit_bias);
-        return Sdpa.run_attention(q, &result.k, &result.v, mask, flash_params, &sdpa_params);
+        return Sdpa.run_attention(
+            q,
+            &result.k,
+            &result.v,
+            mask,
+            flash_params,
+            sdpa_params,
+            result.logit_bias.as_ref(),
+        );
     }
 
     // Normal / Rotating cache: standard path
     let (k_out, v_out) = kv_cache.append(k, v)?;
-    Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, sdpa_params)
+
+    // For rotating (sliding-window) caches that have wrapped around during
+    // prefill (q_len > 1), the returned K/V are in circular-buffer order.
+    // Reorder to temporal order so the mask columns align correctly.
+    let q_len = q.dim(2)?;
+    let (k_out, v_out) = if q_len > 1 {
+        match kv_cache {
+            KvCache::Rotating { k: kc, .. }
+                if kc.current_seq_len >= kc.max_seq_len && kc.offset > 0 =>
+            {
+                let dim = 2; // (batch, heads, seq, head_dim)
+                let offset = kc.offset;
+                let max_len = kc.max_seq_len;
+                let p1_k = k_out.narrow(dim, offset, max_len - offset)?;
+                let p2_k = k_out.narrow(dim, 0, offset)?;
+                let p1_v = v_out.narrow(dim, offset, max_len - offset)?;
+                let p2_v = v_out.narrow(dim, 0, offset)?;
+                (
+                    Tensor::cat(&[&p1_k, &p2_k], dim)?,
+                    Tensor::cat(&[&p1_v, &p2_v], dim)?,
+                )
+            }
+            _ => (k_out, v_out),
+        }
+    } else {
+        (k_out, v_out)
+    };
+
+    Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, sdpa_params, None)
 }

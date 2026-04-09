@@ -292,7 +292,6 @@ impl Attention {
                 softmax_scale: 1.0 / (cfg.head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -564,14 +563,10 @@ impl Qwen3VLMoETextModel {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(cfg.head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(cfg.head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(layer_idx)?;
             DecoderLayer::new(

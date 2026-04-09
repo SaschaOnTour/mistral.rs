@@ -134,6 +134,7 @@ impl CausalSelfAttention {
                     attention_mask.clone().as_ref(),
                     Some(flash_params),
                     &self.sdpa_params,
+                    None,
                 )?
             }
         };
@@ -221,7 +222,6 @@ impl CausalSelfAttention {
                 softmax_scale: 1.0 / ((cfg.hidden_size / cfg.num_attention_heads) as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -494,14 +494,10 @@ impl Llama {
                 device,
             )
             .unwrap();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(i)?;
             Block::load(

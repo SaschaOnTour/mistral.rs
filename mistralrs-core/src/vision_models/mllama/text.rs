@@ -143,7 +143,6 @@ impl MLlamaTextSelfAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
             rope,
             num_heads: cfg.num_attention_heads / comm.world_size(),
@@ -205,6 +204,7 @@ impl MLlamaTextSelfAttention {
                 attention_mask,
                 None,
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?
@@ -366,7 +366,6 @@ impl MLlamaTextCrossAttention {
                 softmax_scale: 1.0 / (cfg.head_dim() as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -431,6 +430,7 @@ impl MLlamaTextCrossAttention {
                     .as_ref(),
                 None,
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?

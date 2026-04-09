@@ -297,14 +297,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?,
                 rms_eps,
             )?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let qkv =
                 QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.attn_qkv.weight"), device)?)?;
@@ -340,7 +336,6 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: Some(context_window),
                     sinks: None,
-                    qjl_bias: None,
                 },
                 dtype,
             })

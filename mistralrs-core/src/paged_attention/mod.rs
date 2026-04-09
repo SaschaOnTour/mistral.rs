@@ -67,6 +67,13 @@ pub enum AttentionImplementation {
     TurboQuant(u8, QuantNormMode),
 }
 
+impl AttentionImplementation {
+    /// Returns true only for the PagedAttention variant.
+    pub fn is_paged_attention(&self) -> bool {
+        matches!(self, Self::PagedAttention)
+    }
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass)]
 pub enum MemoryGpuConfig {

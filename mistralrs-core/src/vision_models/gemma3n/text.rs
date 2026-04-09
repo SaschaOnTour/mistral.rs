@@ -301,7 +301,6 @@ impl Attention {
                 softmax_scale: 1.0,
                 sliding_window,
                 sinks: None,
-                qjl_bias: None,
             },
             q_norm,
             k_norm,
@@ -476,6 +475,7 @@ impl Attention {
             mask.as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?;

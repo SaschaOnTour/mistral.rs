@@ -104,7 +104,6 @@ impl<const CROSS_ATTN: bool> DiaAttention<CROSS_ATTN> {
                 softcap: None,
                 softmax_scale: 1.,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -179,6 +178,7 @@ impl<const CROSS_ATTN: bool> DiaAttention<CROSS_ATTN> {
             &v.contiguous()?,
             attn_mask,
             &self.sdpa_params,
+            None,
         )?;
 
         attn_output = attn_output.transpose(1, 2)?.reshape((b, t, ()))?;

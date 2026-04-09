@@ -264,7 +264,6 @@ impl Attention {
                 softmax_scale: scale,
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -301,6 +300,7 @@ impl Attention {
             attention_mask,
             Some(&flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         self.o_proj

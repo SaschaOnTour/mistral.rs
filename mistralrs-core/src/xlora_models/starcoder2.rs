@@ -204,7 +204,6 @@ impl Attention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -287,6 +286,7 @@ impl Attention {
             attn_mask.as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         if let Some(t) = self.q_proj.quantized_act_type() {

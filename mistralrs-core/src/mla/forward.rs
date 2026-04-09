@@ -324,7 +324,7 @@ pub fn mla_cache_forward(
     let prefix_lens = seqlen_offsets;
     let needs_prefix = prefix_lens.iter().any(|&len| len > 0);
     if !needs_prefix && attention_mask.is_some() {
-        Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params)
+        Sdpa.run_attention(q, k, v, attention_mask, Some(flash_params), sdpa_params, None)
     } else {
         let ((key_cache, value_cache), input_metadata) =
             match (key_cache, value_cache, input_metadata) {
@@ -337,6 +337,7 @@ pub fn mla_cache_forward(
                         attention_mask,
                         Some(flash_params),
                         sdpa_params,
+                        None,
                     );
                 }
             };
@@ -531,6 +532,7 @@ pub fn mla_cache_forward(
                 &v_full.unsqueeze(0)?,
                 mask.as_ref(),
                 sdpa_params,
+                None,
             )?;
             let mut attn_out_i = attn_out_i.squeeze(0)?.transpose(0, 1)?;
             if cur_len < seq_len {

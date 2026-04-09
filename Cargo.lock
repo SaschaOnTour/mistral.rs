@@ -6861,7 +6861,9 @@ dependencies = [
 
 [[package]]
 name = "turboquant-rs"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a70f2d474f30752d8316575cf09aa84813dc333918b5e62723f6fef7af2a852"
 dependencies = [
  "candle-core",
  "cudaforge",

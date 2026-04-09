@@ -282,14 +282,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let attn_k = QLinear::new(&mut ct, &format!("{prefix}.attn_k"), device)?;
             let attn_v = QLinear::new(&mut ct, &format!("{prefix}.attn_v"), device)?;
             let attn_output = QLinear::new(&mut ct, &format!("{prefix}.attn_output"), device)?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager
-                | AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _) => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let QMatMul::QTensor(q_w) = attn_q.inner_ref().clone() else {
                 unreachable!()
@@ -334,7 +330,6 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
                     sinks: None,
-                    qjl_bias: None,
                 },
                 dtype,
             })

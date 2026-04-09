@@ -11,7 +11,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
@@ -105,7 +105,6 @@ impl DecoderAttention {
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }
@@ -154,11 +153,9 @@ impl DecoderAttention {
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
-        let (k, v) = kv_cache.append(&k, &v)?;
-
-        let sdpa_params = self.sdpa_params.with_qjl(kv_cache.qjl_bias(&q)?);
-        let mut attn_output =
-            Sdpa.run_attention(&q, &k, &v, attention_mask, Some(flash_params), &sdpa_params)?;
+        let mut attn_output = crate::attention::cached_attention(
+            kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params),
+        )?;
 
         if let Some(t) = self.wq.quantized_act_type() {
             attn_output = attn_output.to_dtype(t)?;

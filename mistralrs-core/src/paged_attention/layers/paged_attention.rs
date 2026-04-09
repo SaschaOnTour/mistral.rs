@@ -208,6 +208,7 @@ impl PagedAttention {
                 attention_mask,
                 prefix_flash_params.as_ref(),
                 sdpa_params,
+                None,
             );
         }
 
@@ -221,6 +222,7 @@ impl PagedAttention {
                 Some(mask),
                 flash_params,
                 sdpa_params,
+                None,
             )?),
         };
 

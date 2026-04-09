@@ -202,8 +202,8 @@ impl VisionAttention {
                         softcap: None,
                         softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
                         sinks: None,
-                        qjl_bias: None,
                     },
+                    None,
                 )?
                 .squeeze(0)?
                 .transpose(0, 1)?;

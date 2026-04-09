@@ -191,7 +191,6 @@ impl Attention {
                 softmax_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
                 sliding_window,
                 sinks: None,
-                qjl_bias: None,
             },
             q_norm,
             k_norm,
@@ -254,6 +253,7 @@ impl Attention {
             Some(mask),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         if let Some(t) = self.q_proj.quantized_act_type() {

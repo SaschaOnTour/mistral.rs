@@ -115,6 +115,7 @@ impl CausalSelfAttention {
             mask.clone().as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         let mut y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
@@ -205,7 +206,6 @@ impl CausalSelfAttention {
                 softmax_scale: 1.0 / ((cfg.hidden_size / cfg.num_attention_heads) as f32).sqrt(),
                 sliding_window: None,
                 sinks: None,
-                qjl_bias: None,
             },
         })
     }

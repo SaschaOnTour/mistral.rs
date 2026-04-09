@@ -325,10 +325,10 @@ impl Loader for NormalLoader {
         let _progress_guard = ProgressScopeGuard::new(silent);
         let config = std::fs::read_to_string(paths.get_config_filename())?;
 
-        let is_tq_early = paged_attn_config
+        let is_compressed_early = paged_attn_config
             .as_ref()
-            .is_some_and(|c| c.cache_type.is_turboquant());
-        if !self.inner.supports_paged_attention(&config)? && !is_tq_early {
+            .is_some_and(|c| c.cache_type.is_compressed_cache());
+        if !self.inner.supports_paged_attention(&config)? && !is_compressed_early {
             paged_attn_config = None;
         }
 
@@ -506,10 +506,10 @@ impl Loader for NormalLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        let is_turboquant = paged_attn_config
+        let is_compressed = paged_attn_config
             .as_ref()
-            .is_some_and(|c| c.cache_type.is_turboquant());
-        if mapping_uses_cpu && paged_attn_config.is_some() && !is_turboquant {
+            .is_some_and(|c| c.cache_type.is_compressed_cache());
+        if mapping_uses_cpu && paged_attn_config.is_some() && !is_compressed {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
@@ -966,8 +966,8 @@ impl Loader for NormalLoader {
                 | AttentionImplementation::PolarQuantOutlier(_, _)
                 | AttentionImplementation::TurboQuant(_, _)
         ) {
-            // TurboQuant: skip CacheEngine (no paged attention blocks needed).
-            // Models create TurboQuant KvCache directly via NormalCacheType::TurboQuant.
+            // Compressed cache: skip CacheEngine (no paged attention blocks needed).
+            // Models create Compressed KvCache directly via NormalCacheType::Compressed.
             (None, None)
         } else if let Some(paged_attn_config) = paged_attn_config {
             let cache_config = calculate_cache_config(
