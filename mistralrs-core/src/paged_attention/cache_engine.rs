@@ -78,6 +78,7 @@ impl FromStr for PagedCacheType {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for PagedCacheType {
     fn default() -> Self {
         Self::Auto

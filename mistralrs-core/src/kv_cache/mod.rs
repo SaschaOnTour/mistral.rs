@@ -394,6 +394,7 @@ impl NormalCache {
     ///
     /// For compressed caches: creates a shared quantized KV cache across all layers.
     /// For `Eager`/`PagedAttention`: delegates to `new_sliding`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_attention(
         attention_mechanism: &crate::paged_attention::AttentionImplementation,
         num_layers: usize,
