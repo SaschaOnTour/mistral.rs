@@ -629,7 +629,7 @@ impl Runner {
         pa_gpu_mem_usage: Option<f32>,
         pa_ctxt_len: Option<usize>,
         pa_blk_size: Option<usize>,
-        pa_cache_type: Option<PagedCacheType>,
+        pa_cache_type: Option<String>,
         no_paged_attn: bool,
         paged_attn: bool,
         seed: Option<u64>,
@@ -839,40 +839,82 @@ impl Runner {
             (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::ContextSize(max_seq_len),
-                pa_cache_type.unwrap_or_default(),
+                pa_cache_type
+                    .as_deref()
+                    .map(|s| s.parse::<PagedCacheType>())
+                    .transpose()
+                    .map_err(PyApiErr::from)?
+                    .unwrap_or_default(),
+                Default::default(),
             )?),
             (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::ContextSize(ctxt),
-                pa_cache_type.unwrap_or_default(),
+                pa_cache_type
+                    .as_deref()
+                    .map(|s| s.parse::<PagedCacheType>())
+                    .transpose()
+                    .map_err(PyApiErr::from)?
+                    .unwrap_or_default(),
+                Default::default(),
             )?),
             (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
-                pa_cache_type.unwrap_or_default(),
+                pa_cache_type
+                    .as_deref()
+                    .map(|s| s.parse::<PagedCacheType>())
+                    .transpose()
+                    .map_err(PyApiErr::from)?
+                    .unwrap_or_default(),
+                Default::default(),
             )?),
             (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::MbAmount(m),
-                pa_cache_type.unwrap_or_default(),
+                pa_cache_type
+                    .as_deref()
+                    .map(|s| s.parse::<PagedCacheType>())
+                    .transpose()
+                    .map_err(PyApiErr::from)?
+                    .unwrap_or_default(),
+                Default::default(),
             )?),
             (block_size, Some(_m), Some(f), None, true, false) => Some(PagedAttentionConfig::new(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
-                pa_cache_type.unwrap_or_default(),
+                pa_cache_type
+                    .as_deref()
+                    .map(|s| s.parse::<PagedCacheType>())
+                    .transpose()
+                    .map_err(PyApiErr::from)?
+                    .unwrap_or_default(),
+                Default::default(),
             )?),
             (block_size, Some(_m), None, Some(ctxt), true, false) => {
                 Some(PagedAttentionConfig::new(
                     block_size,
                     MemoryGpuConfig::ContextSize(ctxt),
-                    pa_cache_type.unwrap_or_default(),
+                    pa_cache_type
+                        .as_deref()
+                        .map(|s| s.parse::<PagedCacheType>())
+                        .transpose()
+                        .map_err(PyApiErr::from)?
+                        .unwrap_or_default(),
+                    Default::default(),
                 )?)
             }
             (block_size, None, Some(f), Some(_ctxt), true, false) => {
                 Some(PagedAttentionConfig::new(
                     block_size,
                     MemoryGpuConfig::Utilization(f),
-                    pa_cache_type.unwrap_or_default(),
+                    pa_cache_type
+                        .as_deref()
+                        .map(|s| s.parse::<PagedCacheType>())
+                        .transpose()
+                        .map_err(PyApiErr::from)?
+                        .unwrap_or_default(),
+                    Default::default(),
                 )?)
             }
             (_, _, _, _, _, _) => None,
