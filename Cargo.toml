@@ -205,6 +205,3 @@ debug = true
 [profile.dev]
 debug = true
 opt-level = 3
-
-[patch.crates-io]
-mistralrs-kv-cache = { path = "../mistralrs-kv-cache" }
