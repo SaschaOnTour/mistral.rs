@@ -631,7 +631,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(DEFAULT_ENABLE_THINKING);
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(DEFAULT_ENABLE_THINKING);
+        }
         assert_eq!(rendered, "<|think|><bos>hello");
         assert_eq!(rendered, enabled);
     }

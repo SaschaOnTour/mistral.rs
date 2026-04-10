@@ -100,7 +100,11 @@ impl VideoInput {
 /// Sample `num_frames` frame indices uniformly from a video with `total_frames` frames.
 ///
 /// Matches the HF reference: `torch.arange(0, total, total / num_frames).int()`
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn sample_frame_indices(total_frames: usize, num_frames: usize) -> Vec<usize> {
     if num_frames == 0 || total_frames == 0 {
         return Vec::new();

@@ -678,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn gemma4_tool_call_negative_number() {
         let msg = "<|tool_call>call:offset{x:-5,y:3.14}<tool_call|>";
         let result = process_model_specific_message(msg).unwrap();
