@@ -316,6 +316,7 @@ impl Attention {
                     attn_mask.as_ref(),
                     Some(flash_params),
                     &self.sdpa_params,
+                    None,
                 )?
             }
         };
@@ -489,11 +490,10 @@ impl Model {
                 vb_m.dtype(),
                 device,
             )?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(layer_idx)?;
             DecoderLayer::new(

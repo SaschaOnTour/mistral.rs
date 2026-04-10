@@ -9,7 +9,7 @@ use mistralrs_quant::{
 use crate::{
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{self, Activation, F32RmsNorm, Qwen2VLRotaryEmbedding, Sdpa},
+    layers::{self, Activation, F32RmsNorm, Qwen2VLRotaryEmbedding},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         extract_logits, text_models_inputs_processor::FlashParams, EitherCache, IsqModel, KvCache,
@@ -208,19 +208,15 @@ impl Attention {
         self.rotary_emb.forward(cos_sin, &mut q, &mut k)?;
 
         let mut attn_output = {
-            let (k, v) = kv_cache.append(&k, &v)?;
-
-            Sdpa.run_attention(
-                &q.contiguous()?.to_dtype(DType::F32)?,
-                &k.contiguous()?.to_dtype(DType::F32)?,
-                &v.contiguous()?.to_dtype(DType::F32)?,
-                attention_mask
-                    .map(|mask| mask.to_dtype(DType::F32).unwrap())
-                    .as_ref(),
-                Some(flash_params),
+            crate::attention::cached_attention(
+                kv_cache,
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                attention_mask,
                 &self.sdpa_params,
+                Some(flash_params),
             )?
-            .to_dtype(q.dtype())?
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -329,7 +325,13 @@ impl Qwen2VLTextModel {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
-        if !matches!(attention_mechanism, AttentionImplementation::Eager) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;
@@ -416,9 +418,15 @@ impl Qwen2VLTextModel {
             norm,
             layers,
             lm_head,
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
+                None,
+                cfg.hidden_size / cfg.num_attention_heads,
+                (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
             )),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {

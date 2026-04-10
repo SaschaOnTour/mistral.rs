@@ -21,31 +21,53 @@ pub(crate) fn maybe_synchronize(device: &Device) -> Result<()> {
 }
 
 /// Computes softmax(QK^T*sqrt(d_k))V
+///
+/// `logit_bias`: optional additive bias on attention logits (before softmax),
+/// used for compressed-cache bias correction.
 pub(crate) fn naive_sdpa(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: Option<&Tensor>,
     sdpa_params: &SdpaParams,
+    logit_bias: Option<&Tensor>,
 ) -> Result<Tensor> {
     maybe_synchronize(q.device())?;
 
     // Use chunked attention with a closure that captures the necessary parameters
-    chunked_attention(q, k, v, mask, |q_chunk, k, v, mask_chunk| {
-        let mut att =
-            MatMul.matmul_affine_mul(q_chunk, &k.t()?, sdpa_params.softmax_scale.into())?;
+    chunked_attention(
+        q,
+        k,
+        v,
+        mask,
+        |q_chunk, k, v, mask_chunk, q_offset, q_chunk_len| {
+            let mut att =
+                MatMul.matmul_affine_mul(q_chunk, &k.t()?, sdpa_params.softmax_scale.into())?;
 
-        if let Some(softcap) = sdpa_params.softcap {
-            att = (att / softcap as f64)?;
-            att = att.tanh()?;
-            att = (att * softcap as f64)?;
-        }
+            if let Some(softcap) = sdpa_params.softcap {
+                att = (att / softcap as f64)?;
+                att = att.tanh()?;
+                att = (att * softcap as f64)?;
+            }
 
-        if let Some(mask) = mask_chunk {
-            att = att.broadcast_add(mask)?;
-        }
+            if let Some(mask) = mask_chunk {
+                att = att.broadcast_add(mask)?;
+            }
 
-        att = candle_nn::ops::softmax_last_dim(&att)?;
-        MatMul.matmul(&att, v)
-    })
+            // Compressed-cache logit bias correction.
+            // Narrow the bias to match the current q_chunk when using chunked attention.
+            if let Some(bias) = logit_bias {
+                let bias_q_len = bias.dim(2)?;
+                let bias_chunk = if bias_q_len > q_chunk_len {
+                    bias.narrow(2, q_offset, q_chunk_len)?
+                } else {
+                    bias.clone()
+                };
+                att = att.broadcast_add(&bias_chunk)?;
+            }
+
+            att = candle_nn::ops::softmax_last_dim(&att)?;
+            MatMul.matmul(&att, v)
+        },
+    )
 }

@@ -65,6 +65,7 @@ pub async fn run_bench(
         paged_ctxt_len,
         paged_attn_block_size,
         paged_cache_type,
+        paged_norm_mode,
     ) = extract_paged_attn_settings(&model_type);
 
     let (cpu, device_layers) = extract_device_settings(&model_type);
@@ -89,7 +90,8 @@ pub async fn run_bench(
         .with_paged_attn_gpu_mem_usage_optional(paged_attn_gpu_mem_usage)
         .with_paged_ctxt_len_optional(paged_ctxt_len)
         .with_paged_attn_block_size_optional(paged_attn_block_size)
-        .with_paged_attn_cache_type(paged_cache_type);
+        .with_paged_attn_cache_type(paged_cache_type)
+        .with_paged_attn_norm_mode(paged_norm_mode);
 
     let mistralrs = builder.build().await?;
     info!("Model loaded.");

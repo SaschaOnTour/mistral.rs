@@ -139,6 +139,7 @@ impl PrefixCacheManagerV2 {
                     k.all_data().as_ref().expect("No KV cache data").device()
                 }
                 KvCache::Shared { .. } => continue,
+                KvCache::Compressed { device, .. } => device,
             };
 
             if !matches!(cache_device, Device::Cpu) {
@@ -167,6 +168,7 @@ impl PrefixCacheManagerV2 {
                     k.all_data().as_ref().expect("No KV cache data").device()
                 }
                 KvCache::Shared { .. } => continue,
+                KvCache::Compressed { device, .. } => device,
             };
 
             if !matches!(cache_device, Device::Cpu) {

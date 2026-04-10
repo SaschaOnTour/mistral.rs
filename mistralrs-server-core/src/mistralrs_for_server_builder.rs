@@ -237,6 +237,8 @@ pub struct MistralRsForServerBuilder {
 
     /// PagedAttention KV cache type
     paged_cache_type: PagedCacheType,
+    /// Quantization norm mode (MaxNorm or L2Norm)
+    paged_norm_mode: mistralrs_core::QuantNormMode,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -269,6 +271,7 @@ impl Default for MistralRsForServerBuilder {
             search_callback: defaults::SEARCH_CALLBACK,
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
+            paged_norm_mode: mistralrs_core::QuantNormMode::MaxNorm,
         }
     }
 }
@@ -525,9 +528,15 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets the block size for PagedAttention.
+    /// Sets the KV cache quantization type.
     pub fn with_paged_attn_cache_type(mut self, cache_type: PagedCacheType) -> Self {
         self.paged_cache_type = cache_type;
+        self
+    }
+
+    /// Sets the normalization mode for quantized KV cache.
+    pub fn with_paged_attn_norm_mode(mut self, norm_mode: mistralrs_core::QuantNormMode) -> Self {
+        self.paged_norm_mode = norm_mode;
         self
     }
 
@@ -633,6 +642,7 @@ impl MistralRsForServerBuilder {
             self.paged_attn_gpu_mem_usage,
             self.paged_ctxt_len,
             self.paged_cache_type,
+            self.paged_norm_mode,
             !paged_attn,
         )?;
 
@@ -769,6 +779,7 @@ impl MistralRsForServerBuilder {
             self.paged_attn_gpu_mem_usage,
             self.paged_ctxt_len,
             self.paged_cache_type,
+            self.paged_norm_mode,
             !paged_attn,
         )?;
 
@@ -1099,8 +1110,20 @@ fn init_cache_config(
     paged_attn_gpu_mem_usage: Option<f32>,
     paged_ctxt_len: Option<usize>,
     cache_type: PagedCacheType,
+    norm_mode: mistralrs_core::QuantNormMode,
     no_paged_attn: bool,
 ) -> Result<Option<PagedAttentionConfig>> {
+    // Compressed cache works on any device (including CPU) and doesn't need
+    // GPU memory allocation. Create a minimal config and return early.
+    if cache_type.is_compressed_cache() {
+        return Ok(Some(PagedAttentionConfig::new(
+            paged_attn_block_size,
+            MemoryGpuConfig::ContextSize(0), // Not used for compressed cache
+            cache_type,
+            norm_mode,
+        )?));
+    }
+
     match (
         paged_attn_block_size,
         paged_attn_gpu_mem,
@@ -1113,21 +1136,25 @@ fn init_cache_config(
             block_size,
             MemoryGpuConfig::Utilization(0.9),
             cache_type,
+            norm_mode,
         )?)),
         (block_size, None, None, Some(ctxt), true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::ContextSize(ctxt),
             cache_type,
+            norm_mode,
         )?)),
         (block_size, None, Some(f), None, true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::Utilization(f),
             cache_type,
+            norm_mode,
         )?)),
         (block_size, Some(m), None, None, true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::MbAmount(m),
             cache_type,
+            norm_mode,
         )?)),
         (block_size, Some(_m), Some(f), None, true, false) => {
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
@@ -1135,6 +1162,7 @@ fn init_cache_config(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
+                norm_mode,
             )?))
         }
         (block_size, Some(_m), None, Some(ctxt), true, false) => {
@@ -1143,6 +1171,7 @@ fn init_cache_config(
                 block_size,
                 MemoryGpuConfig::ContextSize(ctxt),
                 cache_type,
+                norm_mode,
             )?))
         }
         (block_size, None, Some(f), Some(_ctxt), true, false) => {
@@ -1151,6 +1180,7 @@ fn init_cache_config(
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
+                norm_mode,
             )?))
         }
         (_, _, _, _, _, _) => Ok(None),

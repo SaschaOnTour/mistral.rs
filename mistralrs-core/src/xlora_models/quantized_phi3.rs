@@ -169,6 +169,7 @@ impl LayerWeights {
             attn_mask.as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;

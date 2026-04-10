@@ -294,6 +294,7 @@ impl Attention {
             attention_mask,
             Some(&flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         self.o_proj

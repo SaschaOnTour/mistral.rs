@@ -305,6 +305,7 @@ impl Attention {
             attention_mask,
             Some(&flash_params),
             &sdpa_params,
+            None,
         )?;
 
         self.o_proj.forward(&attn_weights.transpose(1, 2)?.reshape((

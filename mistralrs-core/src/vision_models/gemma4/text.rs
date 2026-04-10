@@ -104,9 +104,7 @@ impl ProportionalRotaryEmbedding {
             inv_freq_vec.push(1f32 / base.powf((2 * i) as f32 / head_dim as f32));
         }
         // Pad with zeros for non-rotated dimensions
-        for _ in rope_angles..half_dim {
-            inv_freq_vec.push(0f32);
-        }
+        inv_freq_vec.resize(half_dim, 0f32);
 
         let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), device)?;
         let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
@@ -574,7 +572,15 @@ impl Attention {
                 };
                 let mask = adjust_mask(mask)?;
 
-                Sdpa.run_attention(&q, &k, &v, mask.as_ref(), flash_params, &self.sdpa_params)?
+                Sdpa.run_attention(
+                    &q,
+                    &k,
+                    &v,
+                    mask.as_ref(),
+                    flash_params,
+                    &self.sdpa_params,
+                    None,
+                )?
             }
         };
 
@@ -1155,16 +1161,15 @@ impl TextModel {
                 .get(&device.location())
                 .expect("No local RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    let hd = if is_sliding!(layer_idx, cfg) {
-                        cfg.head_dim
-                    } else {
-                        cfg.global_head_dim
-                    };
-                    Some(PagedAttention::new(hd, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                let hd = if is_sliding!(layer_idx, cfg) {
+                    cfg.head_dim
+                } else {
+                    cfg.global_head_dim
+                };
+                Some(PagedAttention::new(hd, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(layer_idx)?;
             let kv_shared_layer_index = kv_shared_layer_index(cfg, layer_idx)?;

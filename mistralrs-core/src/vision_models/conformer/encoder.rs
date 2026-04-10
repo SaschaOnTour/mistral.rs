@@ -115,6 +115,7 @@ impl Attention {
                 softmax_scale: self.scale,
                 sinks: None,
             },
+            None,
         )?;
 
         self.o_proj.forward(&attn_weights.transpose(1, 2)?.reshape((

@@ -481,6 +481,7 @@ impl Attention {
             mask.as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?;
@@ -977,7 +978,13 @@ impl TextModel {
                 quant_cfg.get_bits_name(&vb)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;
@@ -1197,21 +1204,40 @@ impl TextModel {
             )?);
         }
 
-        let cache_types = (0..cfg.num_hidden_layers)
-            .map(|layer_idx| {
-                if let Some(owner) = kv_shared_layer_index(cfg, layer_idx) {
-                    NormalCacheType::Shared { owner }
-                } else if is_sliding!(layer_idx, cfg) {
-                    NormalCacheType::SlidingWindow {
-                        window: cfg.sliding_window,
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
+            EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                Some(cfg.sliding_window),
+                cfg.head_dim,
+                (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
+            ))
+        } else {
+            let cache_types = (0..cfg.num_hidden_layers)
+                .map(|layer_idx| {
+                    if let Some(owner) = kv_shared_layer_index(cfg, layer_idx) {
+                        NormalCacheType::Shared { owner }
+                    } else if is_sliding!(layer_idx, cfg) {
+                        NormalCacheType::SlidingWindow {
+                            window: cfg.sliding_window,
+                        }
+                    } else {
+                        NormalCacheType::Normal {
+                            max_seq_len: cfg.max_position_embeddings,
+                        }
                     }
-                } else {
-                    NormalCacheType::Normal {
-                        max_seq_len: cfg.max_position_embeddings,
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
+            EitherCache::Normal(NormalCache::from_types(cache_types))
+        };
         Ok(Self {
             embed_tokens,
             embed_tokens_per_layer,
@@ -1219,7 +1245,7 @@ impl TextModel {
             norm,
             lm_head,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::from_types(cache_types)),
+            cache,
             max_seq_len: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             cfg: ModelConfigMetadata {

@@ -208,6 +208,7 @@ impl Llama4VisionAttention {
                 attention_mask,
                 Some(&flash_params),
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?

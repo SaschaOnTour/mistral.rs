@@ -215,6 +215,7 @@ impl Attention {
             Some(attention_mask),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -345,7 +346,13 @@ impl Model {
                 quant_cfg.get_bits_name(&vb_m)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected AttentionImplementation::Eager");
         }
 

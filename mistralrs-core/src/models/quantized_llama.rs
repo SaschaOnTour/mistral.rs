@@ -12,7 +12,7 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::extract_logits;
@@ -193,11 +193,15 @@ impl LayerWeights {
                     None,
                 )?
             }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                mask,
+                &self.sdpa_params,
+                None,
+            )?,
         };
 
         let y = if mask.is_some() {
@@ -315,9 +319,15 @@ impl ModelConfig::FromGGML for ModelWeights {
                 b: None,
             })?),
             device: ct.device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &AttentionImplementation::Eager,
                 ct.hparams.n_layer as usize,
                 DEFAULT_MAX_SEQ_LEN as usize,
+                None,
+                head_dim,
+                ct.hparams.n_head as usize / gqa,
+                ct.device.clone(),
+                candle_core::DType::F32,
             )),
             max_seq_len: DEFAULT_MAX_SEQ_LEN as usize, // Cannot determine from ggml.
             mapper: None,
@@ -599,11 +609,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             };
             let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
             let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             layers.push(LayerWeights {
                 attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
@@ -649,7 +658,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 b: None,
             })?),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(block_count, max_seq_len)),
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
+                block_count,
+                max_seq_len,
+                None,
+                head_dim,
+                head_count_kv,
+                device.clone(),
+                candle_core::DType::F32,
+            )),
             max_seq_len,
             mapper: Some(mapper),
             dtype,

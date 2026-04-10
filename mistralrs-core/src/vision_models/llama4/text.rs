@@ -12,7 +12,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{embedding, Activation, CausalMasker, Llama3RotaryEmbedding, RmsNorm, Sdpa},
+    layers::{embedding, Activation, CausalMasker, Llama3RotaryEmbedding, RmsNorm},
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     ops::{TopKLastDimOp, TopKOutput},
@@ -222,18 +222,15 @@ impl CausalSelfAttention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q.contiguous()?,
-                    &k.contiguous()?,
-                    &v.contiguous()?,
-                    attention_mask.clone().as_ref(),
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask.clone().as_ref(),
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         y = if attention_mask.is_some() {
@@ -611,11 +608,10 @@ impl TextModel {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(i)?;
             Block::new(
@@ -631,15 +627,22 @@ impl TextModel {
             )
         })?;
 
+        let kv_cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            None,
+            cfg.hidden_size / cfg.num_attention_heads,
+            (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             wte,
             blocks,
             ln_f,
             lm_head,
-            kv_cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            kv_cache,
             device: normal_loading_metadata.real_device,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,

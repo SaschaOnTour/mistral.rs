@@ -14,7 +14,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{self, embedding, Activation, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{self, embedding, Activation, CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -264,18 +264,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -648,12 +645,10 @@ impl Model {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(
-                    PagedAttention::new(head_dim, device, None)
-                        .expect("PagedAttention creation failed"),
-                ),
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper
                 .get_comm_for(layer_idx)
@@ -692,15 +687,34 @@ impl Model {
                 None,
             ))?
         };
-        let cache_types = (0..cfg.num_hidden_layers)
-            .map(|layer_idx| {
-                sliding_window!(layer_idx, cfg)
-                    .map(|window| NormalCacheType::SlidingWindow { window })
-                    .unwrap_or(NormalCacheType::Normal {
-                        max_seq_len: cfg.max_position_embeddings,
-                    })
-            })
-            .collect::<Vec<_>>();
+        let cache = if matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
+            EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+                cfg.sliding_window,
+                cfg.head_dim(),
+                (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
+            ))
+        } else {
+            let cache_types = (0..cfg.num_hidden_layers)
+                .map(|layer_idx| {
+                    sliding_window!(layer_idx, cfg)
+                        .map(|window| NormalCacheType::SlidingWindow { window })
+                        .unwrap_or(NormalCacheType::Normal {
+                            max_seq_len: cfg.max_position_embeddings,
+                        })
+                })
+                .collect::<Vec<_>>();
+            EitherCache::Normal(NormalCache::from_types(cache_types))
+        };
         Ok(Self {
             embed_tokens,
             layers,
@@ -708,7 +722,7 @@ impl Model {
             lm_head,
             sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::from_types(cache_types)),
+            cache,
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,

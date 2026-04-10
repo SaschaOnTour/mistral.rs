@@ -223,6 +223,12 @@ pub fn get_device_layers(
 
     let model_cfg = loader.model_config(config)?;
     let kv_cache_elems = match paged_attn_config {
+        Some(cfg) if cfg.cache_type.is_compressed_cache() => {
+            // Compressed cache manages its own storage — no paged attention blocks needed.
+            // Estimate KV cache size as zero for device mapping purposes;
+            // the compressed cache allocates dynamically during inference.
+            0
+        }
         Some(cfg) => {
             // For MbAmount, clamp to available memory so the capacity check
             // below stays consistent. Utilization and ContextSize pass through

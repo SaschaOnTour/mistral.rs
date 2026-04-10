@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QLinear, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, MatMul, QLinear, RotaryEmbedding};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -117,11 +117,15 @@ impl LayerWeights {
                     None,
                 )?
             }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                mask,
+                &self.sdpa_params,
+                None,
+            )?,
         };
 
         let y = if mask.is_some() {
@@ -284,11 +288,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let attn_k = QLinear::new(&mut ct, &format!("{prefix}.attn_k"), device)?;
             let attn_v = QLinear::new(&mut ct, &format!("{prefix}.attn_v"), device)?;
             let attn_output = QLinear::new(&mut ct, &format!("{prefix}.attn_output"), device)?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let QMatMul::QTensor(q_w) = attn_q.inner_ref().clone() else {
                 unreachable!()
@@ -344,7 +347,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output,
             mapper: Some(mapper),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(block_count, context_window)),
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
+                block_count,
+                context_window,
+                None,
+                head_dim,
+                head_count_kv,
+                device.clone(),
+                candle_core::DType::F32,
+            )),
             max_seq_len: context_window,
             dtype,
         })

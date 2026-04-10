@@ -16,7 +16,7 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RotaryEmbedding, Mlp,
-        RmsNorm, Sdpa,
+        RmsNorm,
     },
     layers_masker::PastKvLenCache,
     mla::{
@@ -298,10 +298,10 @@ impl Attention {
             let kv_split =
                 kv.split(&[self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], D::Minus1)?;
             let k_nope = kv_split[0].clone();
-            let mut v = kv_split[1].clone();
+            let v = kv_split[1].clone();
 
             let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?;
-            let mut k = Tensor::cat(
+            let k = Tensor::cat(
                 &[&k_nope, &k_pe.repeat((1, self.num_attention_heads, 1, 1))?],
                 D::Minus1,
             )?
@@ -383,18 +383,15 @@ impl Attention {
                                 .narrow(D::Minus1, 0, self.cfg.v_head_dim)?
                         }
                     },
-                    None => {
-                        (k, v) = kv_cache.append(&k, &v)?;
-
-                        Sdpa.run_attention(
-                            &q,
-                            &k,
-                            &v,
-                            attention_mask,
-                            Some(flash_params),
-                            &self.sdpa_params,
-                        )?
-                    }
+                    None => crate::attention::cached_attention(
+                        kv_cache,
+                        &q,
+                        &k,
+                        &v,
+                        attention_mask,
+                        &self.sdpa_params,
+                        Some(flash_params),
+                    )?,
                 }
             }
         };
@@ -859,12 +856,10 @@ impl Glm4MoeLite {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(
-                    PagedAttention::new(cfg.v_head_dim, device, None)
-                        .expect("Failed to create PagedAttention"),
-                ),
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(cfg.v_head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper.get_comm_for(layer_idx)?;
             DecoderLayer::new(
@@ -880,15 +875,22 @@ impl Glm4MoeLite {
             )
         })?;
 
+        let cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            None,
+            cfg.q_head_dim(),
+            (cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             lm_head,
             embed_tokens,
             norm,
             layers,
-            cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            cache,
             device: normal_loading_metadata.real_device.clone(),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {

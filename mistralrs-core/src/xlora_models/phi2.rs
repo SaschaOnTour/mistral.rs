@@ -289,8 +289,15 @@ impl Attention {
 
         let (k, v) = Cache::update_kv_cache(kv_cache, k, v)?;
 
-        let attn_output =
-            Sdpa.run_attention(&q, &k, &v, mask, Some(flash_params), &self.sdpa_params)?;
+        let attn_output = Sdpa.run_attention(
+            &q,
+            &k,
+            &v,
+            mask,
+            Some(flash_params),
+            &self.sdpa_params,
+            None,
+        )?;
 
         let mut attn_output = attn_output
             .transpose(1, 2)?

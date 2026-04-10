@@ -38,11 +38,66 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     );
 }
 
-#[derive(Debug, Clone)]
 pub enum KvCache {
-    Normal { k: SingleCache, v: SingleCache },
-    Rotating { k: RotatingCache, v: RotatingCache },
-    Shared { owner: usize },
+    Normal {
+        k: SingleCache,
+        v: SingleCache,
+    },
+    Rotating {
+        k: RotatingCache,
+        v: RotatingCache,
+    },
+    Shared {
+        owner: usize,
+    },
+    Compressed {
+        /// Shared compressed cache via CompressedKVCache trait.
+        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
+        /// Which transformer layer this KvCache instance represents.
+        layer: usize,
+        /// Original device for the tensors.
+        device: candle_core::Device,
+        /// Original dtype for the tensors.
+        dtype: candle_core::DType,
+    },
+}
+
+impl Clone for KvCache {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Normal { k, v } => Self::Normal {
+                k: k.clone(),
+                v: v.clone(),
+            },
+            Self::Rotating { k, v } => Self::Rotating {
+                k: k.clone(),
+                v: v.clone(),
+            },
+            Self::Shared { owner } => Self::Shared { owner: *owner },
+            Self::Compressed {
+                cache,
+                layer,
+                device,
+                dtype,
+            } => Self::Compressed {
+                cache: cache.clone(),
+                layer: *layer,
+                device: device.clone(),
+                dtype: *dtype,
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for KvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Normal { .. } => write!(f, "KvCache::Normal"),
+            Self::Rotating { .. } => write!(f, "KvCache::Rotating"),
+            Self::Shared { owner } => write!(f, "KvCache::Shared(owner={owner})"),
+            Self::Compressed { layer, .. } => write!(f, "KvCache::Compressed(layer={layer})"),
+        }
+    }
 }
 
 impl KvCache {
@@ -62,11 +117,35 @@ impl KvCache {
         Self::Shared { owner }
     }
 
+    /// Creates a new compressed KV cache for a specific layer.
+    ///
+    /// The `cache` is a shared `Arc<Mutex<dyn CompressedKVCache>>` that holds
+    /// compressed data for ALL layers and heads. Each `KvCache::Compressed`
+    /// instance references it with a specific `layer` index.
+    pub fn new_compressed(
+        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
+        layer: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> Self {
+        Self::Compressed {
+            cache,
+            layer,
+            device,
+            dtype,
+        }
+    }
+
     pub fn k(&self) -> Result<Option<Tensor>> {
         match self {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
             Self::Shared { .. } => Ok(None),
+            Self::Compressed { .. } => {
+                // Compressed cache: K not accessible as raw tensor.
+                // Use cached_attention() for attention computation.
+                Ok(None)
+            }
         }
     }
 
@@ -75,12 +154,22 @@ impl KvCache {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
             Self::Shared { .. } => Ok(None),
+            Self::Compressed { .. } => {
+                // Compressed cache: V not accessible as raw tensor.
+                Ok(None)
+            }
         }
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
+        if self.is_compressed() {
+            candle_core::bail!(
+                "KvCache::append() called on compressed cache — use cached_attention() instead"
+            );
+        }
+
         let (out_k, out_v) = match self {
             Self::Normal { k: kc, v: vc } => {
                 kc.append(&k)?;
@@ -97,6 +186,7 @@ impl KvCache {
                     "attempted to append KV data to shared cache owned by layer {owner}"
                 );
             }
+            Self::Compressed { .. } => unreachable!("handled above"),
         };
         let k = match out_k {
             None => {
@@ -105,6 +195,7 @@ impl KvCache {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
                     Self::Shared { .. } => unreachable!(),
+                    Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
@@ -117,6 +208,7 @@ impl KvCache {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
                     Self::Shared { .. } => unreachable!(),
+                    Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
@@ -130,6 +222,10 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::Shared { .. } => 0,
+            Self::Compressed { cache, layer, .. } => {
+                let guard = cache.lock().expect("Compressed cache lock poisoned");
+                guard.seq_len(*layer)
+            }
         }
     }
 
@@ -144,6 +240,13 @@ impl KvCache {
                 v.reset();
             }
             Self::Shared { .. } => {}
+            Self::Compressed { cache, .. } => {
+                cache
+                    .lock()
+                    .expect("Compressed cache lock poisoned")
+                    .reset()
+                    .expect("Compressed cache reset failed");
+            }
         }
     }
 
@@ -161,6 +264,16 @@ impl KvCache {
                 Ok(())
             }
             Self::Shared { .. } => Ok(()),
+            Self::Compressed { .. } => {
+                let current = self.current_seq_len();
+                if len == current {
+                    Ok(())
+                } else {
+                    candle_core::bail!(
+                        "Compressed cache does not support resize (current={current}, requested={len})"
+                    )
+                }
+            }
         }
     }
 
@@ -177,6 +290,16 @@ impl KvCache {
                 Ok(())
             }
             Self::Shared { .. } => Ok(()),
+            Self::Compressed { .. } => {
+                let current = self.current_seq_len();
+                if len == current {
+                    Ok(())
+                } else {
+                    candle_core::bail!(
+                        "Compressed cache does not support resize (current={current}, requested={len})"
+                    )
+                }
+            }
         }
     }
 
@@ -187,6 +310,20 @@ impl KvCache {
     pub fn is_shared(&self) -> bool {
         matches!(self, Self::Shared { .. })
     }
+
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, Self::Compressed { .. })
+    }
+
+    /// Returns a clone of this cache if it is a `Compressed` variant (clones the `Arc` reference).
+    /// Returns `None` for `Normal` / `Rotating` variants.
+    fn clone_compressed_ref(&self) -> Option<KvCache> {
+        if self.is_compressed() {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -194,9 +331,23 @@ pub struct NormalCache(pub Vec<KvCache>);
 
 #[derive(Debug)]
 pub enum NormalCacheType {
-    Normal { max_seq_len: usize },
-    SlidingWindow { window: usize },
-    Shared { owner: usize },
+    Normal {
+        max_seq_len: usize,
+    },
+    SlidingWindow {
+        window: usize,
+    },
+    Shared {
+        owner: usize,
+    },
+    /// Compressed quantized KV cache. All layers share a single
+    /// `CompressedKVCache` via `Arc<Mutex>`.
+    Compressed {
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        num_layers: usize,
+    },
 }
 
 impl NormalCache {
@@ -239,6 +390,59 @@ impl NormalCache {
         }
     }
 
+    /// Creates the appropriate cache based on the attention mechanism.
+    ///
+    /// For compressed caches: creates a shared quantized KV cache across all layers.
+    /// For `Eager`/`PagedAttention`: delegates to `new_sliding`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_attention(
+        attention_mechanism: &crate::paged_attention::AttentionImplementation,
+        num_layers: usize,
+        max_seq_len: usize,
+        sliding_window: Option<usize>,
+        head_dim: usize,
+        num_kv_heads: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> Arc<Mutex<Self>> {
+        use crate::paged_attention::AttentionImplementation;
+        match attention_mechanism {
+            AttentionImplementation::PolarQuant(bits, nm) => Self::new_pq(
+                num_layers,
+                *bits,
+                head_dim,
+                num_kv_heads,
+                device,
+                dtype,
+                *nm,
+            )
+            .expect("Failed to create PQ cache"),
+            AttentionImplementation::PolarQuantOutlier(bits, nm) => Self::new_pqo(
+                num_layers,
+                *bits,
+                head_dim,
+                num_kv_heads,
+                device,
+                dtype,
+                *nm,
+            )
+            .expect("Failed to create PQO cache"),
+            AttentionImplementation::TurboQuant(bits, nm) => Self::new_tq(
+                num_layers,
+                *bits,
+                head_dim,
+                num_kv_heads,
+                device,
+                dtype,
+                *nm,
+            )
+            .expect("Failed to create TQ cache"),
+            AttentionImplementation::Eager | AttentionImplementation::PagedAttention => {
+                Self::new_sliding(num_layers, max_seq_len, sliding_window)
+            }
+        }
+    }
+
     pub fn from_types(types: Vec<NormalCacheType>) -> Arc<Mutex<Self>> {
         let mut caches = Vec::new();
         for ty in types {
@@ -252,9 +456,105 @@ impl NormalCache {
                 NormalCacheType::Shared { owner } => {
                     caches.push(KvCache::new_shared(owner));
                 }
+                NormalCacheType::Compressed { .. } => {
+                    panic!("Use NormalCache::new_for_attention() for compressed caches")
+                }
             }
         }
         Arc::new(Mutex::new(Self(caches)))
+    }
+
+    /// PQ: PolarQuant plain (standard codebook, no outlier, no QJL).
+    pub fn new_pq(
+        num_layers: usize,
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+        norm_mode: crate::paged_attention::QuantNormMode,
+    ) -> candle_core::Result<Arc<Mutex<Self>>> {
+        let cfg =
+            Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cache = turboquant::cache::PqoCache::new(cfg);
+        Self::new_compressed_cache(cache, num_layers, device, dtype)
+    }
+
+    /// PQO: PolarQuant Outlier (all blocks use outlier codebook, no QJL).
+    pub fn new_pqo(
+        num_layers: usize,
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+        norm_mode: crate::paged_attention::QuantNormMode,
+    ) -> candle_core::Result<Arc<Mutex<Self>>> {
+        let cfg = Self::compressed_cache_config(
+            bits,
+            head_dim,
+            num_kv_heads,
+            num_layers,
+            norm_mode,
+            usize::MAX,
+        );
+        let pqo = turboquant::cache::PqoCache::new(cfg);
+        Self::new_compressed_cache(pqo, num_layers, device, dtype)
+    }
+
+    /// TQ: TurboQuant (Paper Algorithm 2: (bits-1)-bit Polar + 1-bit QJL).
+    pub fn new_tq(
+        num_layers: usize,
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+        norm_mode: crate::paged_attention::QuantNormMode,
+    ) -> candle_core::Result<Arc<Mutex<Self>>> {
+        let cfg =
+            Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cache = turboquant::cache::TqCache::new(cfg);
+        Self::new_compressed_cache(cache, num_layers, device, dtype)
+    }
+
+    /// Build a compressed CacheConfig from mistral.rs parameters.
+    fn compressed_cache_config(
+        bits: u8,
+        head_dim: usize,
+        num_kv_heads: usize,
+        num_layers: usize,
+        norm_mode: crate::paged_attention::QuantNormMode,
+        outlier_blocks: usize,
+    ) -> turboquant::cache::CacheConfig {
+        turboquant::cache::CacheConfig {
+            bits,
+            head_dim,
+            num_kv_heads,
+            num_layers,
+            norm_mode,
+            outlier_blocks,
+        }
+    }
+
+    fn new_compressed_cache(
+        cache_impl: impl mistralrs_kv_cache::CompressedKVCache + 'static,
+        num_layers: usize,
+        device: candle_core::Device,
+        dtype: candle_core::DType,
+    ) -> candle_core::Result<Arc<Mutex<Self>>> {
+        let shared: Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
+            Arc::new(std::sync::Mutex::new(cache_impl));
+        let mut caches = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            caches.push(KvCache::new_compressed(
+                shared.clone(),
+                layer,
+                device.clone(),
+                dtype,
+            ));
+        }
+        Ok(Arc::new(Mutex::new(Self(caches))))
     }
 }
 
@@ -285,6 +585,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     new_v_cache.push(None);
                     continue;
                 };
+                // Compressed caches are shared via Arc — skip tensor extraction.
+                if cache.is_compressed() {
+                    new_k_cache.push(None);
+                    new_v_cache.push(None);
+                    continue;
+                }
                 match cache {
                     KvCache::Normal { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
@@ -296,6 +602,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         new_k_cache.push(None);
                         new_v_cache.push(None);
                         continue;
+                    }
+                    KvCache::Compressed { .. } => {
+                        unreachable!("handled above")
                     }
                 }
             };
@@ -324,6 +633,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
                     KvCache::Shared { .. } => continue,
+                    KvCache::Compressed { .. } => {
+                        // Compressed cache is shared; skip tensor extraction per-sequence.
+                        continue;
+                    }
                 };
                 let offset = i * first_k.dims()[0];
                 batch_k.slice_set(&src_k, 0, offset).unwrap();
@@ -399,6 +712,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::Shared { owner } => {
                     caches.push(KvCache::Shared { owner: *owner });
                 }
+                KvCache::Compressed { .. } => {
+                    caches.push(cache_ref.clone_compressed_ref().unwrap());
+                }
             }
         }
         *pipeline.cache().normal() = NormalCache(caches);
@@ -418,6 +734,19 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 continue;
             }
+            // Compressed caches: store shared Arc reference into each sequence.
+            if let Some(compressed) = cache.clone_compressed_ref() {
+                for seq in seqs.iter_mut() {
+                    let output_cache = if modify_draft_cache {
+                        seq.normal_draft_cache()
+                    } else {
+                        seq.normal_cache()
+                    };
+                    let seq_cache = &mut output_cache[layer];
+                    *seq_cache = Some(compressed.clone());
+                }
+                continue;
+            }
             // This case for llama 3.2 vision cross attn
             if cache.k().unwrap().is_none() {
                 continue;
@@ -431,6 +760,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                 }
                 KvCache::Shared { .. } => unreachable!(),
+                KvCache::Compressed { .. } => unreachable!(),
             };
 
             let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
@@ -492,6 +822,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                         });
                     }
                     KvCache::Shared { .. } => unreachable!(),
+                    KvCache::Compressed { .. } => unreachable!(),
                 }
             }
         }
@@ -504,8 +835,16 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         load_preallocated_cache: bool,
     ) {
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
+            let mut compressed_reset = false;
             for layer in pipeline.cache().normal().0.iter_mut() {
-                layer.reset();
+                if layer.is_compressed() {
+                    if !compressed_reset {
+                        layer.reset();
+                        compressed_reset = true;
+                    }
+                } else {
+                    layer.reset();
+                }
             }
             return;
         }
@@ -553,6 +892,20 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 KvCache::Shared { owner } => {
                     *layer = KvCache::Shared { owner: *owner };
+                    continue;
+                }
+                KvCache::Compressed {
+                    cache: compressed_cache,
+                    layer: compressed_layer,
+                    ..
+                } => {
+                    if *compressed_layer == 0 {
+                        compressed_cache
+                            .lock()
+                            .expect("Compressed cache lock poisoned")
+                            .reset()
+                            .expect("Compressed cache reset failed");
+                    }
                     continue;
                 }
                 KvCache::Normal { .. } => {}
@@ -622,7 +975,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     };
                     *layer = cache;
                 }
-                KvCache::Rotating { .. } | KvCache::Shared { .. } => unreachable!(),
+                KvCache::Rotating { .. } | KvCache::Shared { .. } | KvCache::Compressed { .. } => {
+                    unreachable!()
+                }
             }
         }
     }

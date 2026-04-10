@@ -15,7 +15,6 @@ use crate::{
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         self, embedding, CausalMasker, GptOssRotaryEmbedding, MatMul, RmsNorm, RotaryEmbedding,
-        Sdpa,
     },
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -318,18 +317,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -645,11 +641,10 @@ impl Model {
                 .cloned()
                 .expect("No RoPE for device");
 
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(cfg.head_dim(), &device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(cfg.head_dim(), &device, None)?)
+            } else {
+                None
             };
 
             let comm = mapper.get_comm_for(layer_idx)?;

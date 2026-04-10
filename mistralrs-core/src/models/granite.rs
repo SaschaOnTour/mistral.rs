@@ -19,7 +19,7 @@ use crate::{
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -1353,18 +1353,15 @@ impl CausalSelfAttention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask.clone().as_ref(),
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask.clone().as_ref(),
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -1814,11 +1811,10 @@ impl GraniteMoeHybrid {
                     } else {
                         None
                     };
-                    let paged_attn = match &attention_mechanism {
-                        AttentionImplementation::Eager => None,
-                        AttentionImplementation::PagedAttention => {
-                            Some(PagedAttention::new(head_dim, device, None)?)
-                        }
+                    let paged_attn = if attention_mechanism.is_paged_attention() {
+                        Some(PagedAttention::new(head_dim, device, None)?)
+                    } else {
+                        None
                     };
                     DecoderLayer::Attention(Block::load(
                         vb_layer,

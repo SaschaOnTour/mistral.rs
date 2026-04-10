@@ -23,6 +23,7 @@ pub use layers::PagedAttention;
 pub use scheduler::{
     PagedAttentionScheduler, PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
 };
+pub use turboquant::cache::config::QuantNormMode;
 
 use crate::MemoryUsage;
 use tracing::info;
@@ -35,6 +36,7 @@ pub struct PagedAttentionConfig {
     pub(crate) block_size: Option<usize>,
     pub(crate) mem_gpu: MemoryGpuConfig,
     pub(crate) cache_type: PagedCacheType,
+    pub(crate) norm_mode: QuantNormMode,
 }
 
 impl PagedAttentionConfig {
@@ -42,11 +44,13 @@ impl PagedAttentionConfig {
         block_size: Option<usize>,
         mem_gpu: MemoryGpuConfig,
         cache_type: PagedCacheType,
+        norm_mode: QuantNormMode,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             block_size,
             mem_gpu,
             cache_type,
+            norm_mode,
         })
     }
 }
@@ -55,6 +59,19 @@ impl PagedAttentionConfig {
 pub enum AttentionImplementation {
     Eager,
     PagedAttention,
+    /// PolarQuant plain: block-level quantization, standard codebook, no QJL.
+    PolarQuant(u8, QuantNormMode),
+    /// PolarQuant Outlier: all blocks use outlier codebook, no QJL.
+    PolarQuantOutlier(u8, QuantNormMode),
+    /// TurboQuant: (bits-1)-bit PolarQuant + 1-bit QJL (Paper algorithm).
+    TurboQuant(u8, QuantNormMode),
+}
+
+impl AttentionImplementation {
+    /// Returns true only for the PagedAttention variant.
+    pub fn is_paged_attention(&self) -> bool {
+        matches!(self, Self::PagedAttention)
+    }
 }
 
 #[derive(Clone, Copy)]

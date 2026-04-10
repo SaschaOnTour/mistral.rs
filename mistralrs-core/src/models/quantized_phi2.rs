@@ -14,7 +14,6 @@ use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
 use crate::layers::MatMul;
-use crate::layers::Sdpa;
 use crate::layers::{CausalMasker, QLinear};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::AttentionImplementation;
@@ -114,11 +113,15 @@ impl LayerWeights {
                     None,
                 )?
             }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                mask,
+                &self.sdpa_params,
+                None,
+            )?,
         };
 
         let y = if mask.is_some() {
@@ -287,11 +290,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 ct.tensor(&format!("{prefix}.attn_norm.bias"), device)?,
                 ln_eps,
             )?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let qkv = QLinear::new(&mut ct, &format!("{prefix}.attn_qkv"), device)?;
             let out = QLinear::new(&mut ct, &format!("{prefix}.attn_output"), device)?;
@@ -334,7 +336,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output_norm,
             output,
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(block_count, max_seq_len)),
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
+                block_count,
+                max_seq_len,
+                None,
+                head_dim,
+                head_count_kv,
+                device.clone(),
+                candle_core::DType::F32,
+            )),
             max_seq_len,
             mapper,
             dtype,

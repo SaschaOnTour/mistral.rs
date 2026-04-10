@@ -15,7 +15,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{self, Activation, CausalMasker, Phi4MMRotaryEmbedding, RmsNorm, Sdpa},
+    layers::{self, Activation, CausalMasker, Phi4MMRotaryEmbedding, RmsNorm},
     layers_masker::PastKvLenCache,
     paged_attention::{
         encoder_cache::EncoderCacheManager, AttentionImplementation, ModelConfigMetadata,
@@ -179,18 +179,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.qkv_proj.quantized_act_type() {
@@ -394,11 +391,10 @@ impl Phi4MMModel {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(cfg.head_dim(), device, None)?)
-                }
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(cfg.head_dim(), device, None)?)
+            } else {
+                None
             };
             DecoderLayer::new(
                 rotary_emb,
@@ -439,16 +435,22 @@ impl Phi4MMModel {
             mapper.set_nm_device(vb_m.pp("embed_tokens_extend"), false),
         )?;
 
+        let cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.sliding_window,
+            cfg.head_dim(),
+            cfg.num_key_value_heads(),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             layers,
             norm,
             lm_head,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                cfg.sliding_window,
-            )),
+            cache,
             max_seq_len: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,
             embed_tokens,

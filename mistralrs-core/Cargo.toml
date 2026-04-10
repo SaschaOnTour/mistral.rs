@@ -77,6 +77,8 @@ regex.workspace = true
 serde_plain.workspace = true
 as-any.workspace = true
 float8.workspace = true
+turboquant-rs = { version = "0.3.1", features = ["candle", "serde"] }
+mistralrs-kv-cache = "0.2.0"
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 toktrie.workspace = true
@@ -121,6 +123,7 @@ cuda = [
     "mistralrs-quant/cuda",
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
+    "turboquant-rs/cuda",
 ]
 cudnn = ["candle-core/cudnn"]
 metal = [

@@ -8,7 +8,7 @@ use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
 
 use crate::{
     attention::SdpaParams,
-    layers::{CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     pipeline::{KvCache, NormalCache},
 };
@@ -102,15 +102,14 @@ impl EncoderAttention {
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
-        let (k, v) = kv_cache.append(&k, &v)?;
-
-        let attn_output = Sdpa.run_attention(
+        let attn_output = crate::attention::cached_attention(
+            kv_cache,
             &q,
             &k,
             &v,
             attention_mask,
-            None, // no flash params for encoder (causal via mask)
             &self.sdpa_params,
+            None,
         )?;
 
         let attn_output = if attention_mask.is_some() {

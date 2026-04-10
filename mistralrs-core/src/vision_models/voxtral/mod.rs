@@ -11,7 +11,7 @@ use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
@@ -153,15 +153,14 @@ impl DecoderAttention {
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
-        let (k, v) = kv_cache.append(&k, &v)?;
-
-        let mut attn_output = Sdpa.run_attention(
+        let mut attn_output = crate::attention::cached_attention(
+            kv_cache,
             &q,
             &k,
             &v,
             attention_mask,
-            Some(flash_params),
             &self.sdpa_params,
+            Some(flash_params),
         )?;
 
         if let Some(t) = self.wq.quantized_act_type() {
@@ -384,7 +383,7 @@ impl VoxtralModel {
         vb: ShardedVarBuilder,
         _is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
-        _attention_mechanism: AttentionImplementation,
+        attention_mechanism: AttentionImplementation,
     ) -> Result<Self> {
         let mapper = normal_loading_metadata.mapper;
 
@@ -506,10 +505,15 @@ impl VoxtralModel {
             output,
             encoder,
             adapter,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 cfg.n_layers,
                 cfg.model_max_length,
                 cfg.sliding_window,
+                cfg.head_dim,
+                cfg.n_kv_heads,
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
             )),
             device: normal_loading_metadata.real_device,
             max_seq_len: cfg.model_max_length,

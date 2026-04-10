@@ -439,4 +439,5 @@ extern "C" {
         window_size: c_int,
         stream: CUstream,
     );
+
 }

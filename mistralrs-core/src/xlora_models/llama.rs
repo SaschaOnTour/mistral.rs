@@ -115,6 +115,7 @@ impl CausalSelfAttention {
             mask.clone().as_ref(),
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         let mut y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;

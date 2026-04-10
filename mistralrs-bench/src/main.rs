@@ -441,21 +441,25 @@ async fn main() -> anyhow::Result<()> {
             block_size,
             MemoryGpuConfig::ContextSize(max_seq_len),
             args.cache_type.unwrap_or_default(),
+            Default::default(),
         )?),
         (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::ContextSize(ctxt),
             args.cache_type.unwrap_or_default(),
+            Default::default(),
         )?),
         (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::Utilization(f),
             args.cache_type.unwrap_or_default(),
+            Default::default(),
         )?),
         (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             MemoryGpuConfig::MbAmount(m),
             args.cache_type.unwrap_or_default(),
+            Default::default(),
         )?),
         (block_size, Some(_m), Some(f), None, true, false) => {
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
@@ -463,6 +467,7 @@ async fn main() -> anyhow::Result<()> {
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 args.cache_type.unwrap_or_default(),
+                Default::default(),
             )?)
         }
         (block_size, Some(_m), None, Some(ctxt), true, false) => {
@@ -471,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
                 block_size,
                 MemoryGpuConfig::ContextSize(ctxt),
                 args.cache_type.unwrap_or_default(),
+                Default::default(),
             )?)
         }
         (block_size, None, Some(f), Some(_ctxt), true, false) => {
@@ -479,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
                 block_size,
                 MemoryGpuConfig::Utilization(f),
                 args.cache_type.unwrap_or_default(),
+                Default::default(),
             )?)
         }
         (_, _, _, _, _, _) => None,

@@ -20,9 +20,7 @@ use crate::{
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{
-        embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding, Sdpa,
-    },
+    layers::{embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -353,17 +351,15 @@ impl FullAttention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask.clone().as_ref(),
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask.clone().as_ref(),
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -781,11 +777,10 @@ impl Model {
                         .get(&device.location())
                         .expect("No RoPE for device location!")
                         .clone();
-                    let paged_attn = match &attention_mechanism {
-                        AttentionImplementation::Eager => None,
-                        AttentionImplementation::PagedAttention => {
-                            Some(PagedAttention::new(cfg.head_dim, device, None)?)
-                        }
+                    let paged_attn = if attention_mechanism.is_paged_attention() {
+                        Some(PagedAttention::new(cfg.head_dim, device, None)?)
+                    } else {
+                        None
                     };
                     LayerImpl::FullAttention(FullAttention::load(
                         vb_layer.clone(),

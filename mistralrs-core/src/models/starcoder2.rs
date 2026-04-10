@@ -13,7 +13,7 @@ use crate::{
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
-    layers::{embedding, layer_norm, Activation, CausalMasker, MatMul, RotaryEmbedding, Sdpa},
+    layers::{embedding, layer_norm, Activation, CausalMasker, MatMul, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -308,18 +308,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -487,12 +484,10 @@ impl Model {
                 .get(&device.location())
                 .expect("No RoPE for device location!")
                 .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(
-                    PagedAttention::new(head_dim, device, None)
-                        .expect("PagedAttention creation failed"),
-                ),
+            let paged_attn = if attention_mechanism.is_paged_attention() {
+                Some(PagedAttention::new(head_dim, device, None)?)
+            } else {
+                None
             };
             let comm = mapper
                 .get_comm_for(layer_idx)
@@ -517,6 +512,16 @@ impl Model {
             embed_tokens.embeddings(),
             normal_loading_metadata.loading_isq,
         )?;
+        let cache = EitherCache::Normal(NormalCache::new_for_attention(
+            &attention_mechanism,
+            cfg.num_hidden_layers,
+            cfg.max_position_embeddings,
+            cfg.sliding_window,
+            cfg.hidden_size / cfg.num_attention_heads,
+            (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+            normal_loading_metadata.real_device.clone(),
+            candle_core::DType::F32,
+        ));
         Ok(Self {
             embed_tokens,
             layers,
@@ -526,11 +531,7 @@ impl Model {
             ))?),
             sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                cfg.sliding_window,
-            )),
+            cache,
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,

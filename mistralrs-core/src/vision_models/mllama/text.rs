@@ -204,6 +204,7 @@ impl MLlamaTextSelfAttention {
                 attention_mask,
                 None,
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?
@@ -429,6 +430,7 @@ impl MLlamaTextCrossAttention {
                     .as_ref(),
                 None,
                 &self.sdpa_params,
+                None,
             )?
             .transpose(1, 2)?
             .contiguous()?
@@ -563,7 +565,13 @@ impl MLlamaTextModel {
                 quant_cfg.get_bits_name(&vb)
             );
         }
-        if !matches!(attention_mechanism, AttentionImplementation::Eager) {
+        if !matches!(
+            attention_mechanism,
+            AttentionImplementation::Eager
+                | AttentionImplementation::PolarQuant(_, _)
+                | AttentionImplementation::PolarQuantOutlier(_, _)
+                | AttentionImplementation::TurboQuant(_, _)
+        ) {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;
@@ -666,9 +674,15 @@ impl MLlamaTextModel {
                 v_head_dim: cfg.head_dim(),
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_for_attention(
+                &attention_mechanism,
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
+                None,
+                cfg.head_dim(),
+                (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
+                normal_loading_metadata.real_device.clone(),
+                candle_core::DType::F32,
             )),
             device: normal_loading_metadata.real_device,
             max_position_embeddings: cfg.max_position_embeddings,

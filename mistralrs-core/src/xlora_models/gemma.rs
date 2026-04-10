@@ -303,6 +303,7 @@ impl Attention {
             attention_mask,
             Some(flash_params),
             &self.sdpa_params,
+            None,
         )?;
 
         if let Some(t) = self.q_proj.quantized_act_type() {
