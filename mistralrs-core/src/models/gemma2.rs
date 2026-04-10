@@ -15,9 +15,7 @@ use crate::{
     attention::SdpaParams,
     device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
-    layers::{
-        embedding, Activation, CausalMasker, GemmaRmsNorm, MatMul, Mlp, RotaryEmbedding,
-    },
+    layers::{embedding, Activation, CausalMasker, GemmaRmsNorm, MatMul, Mlp, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -253,7 +251,15 @@ impl Attention {
             },
             None => {
                 // self.sliding_window is None if !self.use_sliding_window
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, mask, &self.sdpa_params, Some(flash_params))?
+                crate::attention::cached_attention(
+                    kv_cache,
+                    &q,
+                    &k,
+                    &v,
+                    mask,
+                    &self.sdpa_params,
+                    Some(flash_params),
+                )?
             }
         };
 
@@ -501,7 +507,7 @@ impl Model {
                 num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
                 num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
                     .max(1),
-                sliding_window: None,
+                sliding_window: Some(cfg.sliding_window),
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,

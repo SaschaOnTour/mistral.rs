@@ -222,9 +222,15 @@ impl CausalSelfAttention {
                     )?
                 }
             },
-            None => {
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask.clone().as_ref(), &self.sdpa_params, Some(flash_params))?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask.clone().as_ref(),
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         y = if attention_mask.is_some() {

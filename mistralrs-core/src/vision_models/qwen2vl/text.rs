@@ -209,8 +209,13 @@ impl Attention {
 
         let mut attn_output = {
             crate::attention::cached_attention(
-                kv_cache, &q.contiguous()?, &k.contiguous()?, &v.contiguous()?,
-                attention_mask, &self.sdpa_params, Some(flash_params),
+                kv_cache,
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
             )?
         };
 

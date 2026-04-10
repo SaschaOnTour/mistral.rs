@@ -20,9 +20,7 @@ use crate::{
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{
-        embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding,
-    },
+    layers::{embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding},
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -353,9 +351,15 @@ impl FullAttention {
                     )?
                 }
             },
-            None => {
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask.clone().as_ref(), &self.sdpa_params, Some(flash_params))?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask.clone().as_ref(),
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {

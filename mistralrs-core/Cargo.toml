@@ -77,8 +77,8 @@ regex.workspace = true
 serde_plain.workspace = true
 as-any.workspace = true
 float8.workspace = true
-turboquant-rs = { version = "0.3.0", features = ["candle", "serde"] }
-mistralrs-kv-cache = "0.1.0"
+turboquant-rs = { path = "../../turboquant", features = ["candle", "serde"] }
+mistralrs-kv-cache = { path = "../../mistralrs-kv-cache" }
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 toktrie.workspace = true

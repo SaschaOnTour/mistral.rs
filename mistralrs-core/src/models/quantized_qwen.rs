@@ -125,9 +125,15 @@ impl LayerWeights {
                     None,
                 )?
             }
-            None => {
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, mask, &self.sdpa_params, None)?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                mask,
+                &self.sdpa_params,
+                None,
+            )?,
         };
 
         let y = if mask.is_some() {

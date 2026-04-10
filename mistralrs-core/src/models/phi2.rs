@@ -345,9 +345,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, mask, &self.sdpa_params, Some(flash_params))?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {

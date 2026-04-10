@@ -383,9 +383,15 @@ impl Attention {
                                 .narrow(D::Minus1, 0, self.cfg.v_head_dim)?
                         }
                     },
-                    None => {
-                        crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
-                    }
+                    None => crate::attention::cached_attention(
+                        kv_cache,
+                        &q,
+                        &k,
+                        &v,
+                        attention_mask,
+                        &self.sdpa_params,
+                        Some(flash_params),
+                    )?,
                 }
             }
         };

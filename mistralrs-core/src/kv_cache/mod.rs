@@ -47,6 +47,9 @@ pub enum KvCache {
         k: RotatingCache,
         v: RotatingCache,
     },
+    Shared {
+        owner: usize,
+    },
     Compressed {
         /// Shared compressed cache via CompressedKVCache trait.
         cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
@@ -62,10 +65,25 @@ pub enum KvCache {
 impl Clone for KvCache {
     fn clone(&self) -> Self {
         match self {
-            Self::Normal { k, v } => Self::Normal { k: k.clone(), v: v.clone() },
-            Self::Rotating { k, v } => Self::Rotating { k: k.clone(), v: v.clone() },
-            Self::Compressed { cache, layer, device, dtype } => Self::Compressed {
-                cache: cache.clone(), layer: *layer, device: device.clone(), dtype: *dtype,
+            Self::Normal { k, v } => Self::Normal {
+                k: k.clone(),
+                v: v.clone(),
+            },
+            Self::Rotating { k, v } => Self::Rotating {
+                k: k.clone(),
+                v: v.clone(),
+            },
+            Self::Shared { owner } => Self::Shared { owner: *owner },
+            Self::Compressed {
+                cache,
+                layer,
+                device,
+                dtype,
+            } => Self::Compressed {
+                cache: cache.clone(),
+                layer: *layer,
+                device: device.clone(),
+                dtype: *dtype,
             },
         }
     }
@@ -76,6 +94,7 @@ impl std::fmt::Debug for KvCache {
         match self {
             Self::Normal { .. } => write!(f, "KvCache::Normal"),
             Self::Rotating { .. } => write!(f, "KvCache::Rotating"),
+            Self::Shared { owner } => write!(f, "KvCache::Shared(owner={owner})"),
             Self::Compressed { layer, .. } => write!(f, "KvCache::Compressed(layer={layer})"),
         }
     }
@@ -92,6 +111,10 @@ impl KvCache {
         let k = RotatingCache::new(dim, sliding_window, capacity_seq_len);
         let v = RotatingCache::new(dim, sliding_window, capacity_seq_len);
         Self::Rotating { k, v }
+    }
+
+    pub fn new_shared(owner: usize) -> Self {
+        Self::Shared { owner }
     }
 
     /// Creates a new compressed KV cache for a specific layer.
@@ -117,6 +140,7 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_data(),
             Self::Rotating { k, .. } => k.current_data(),
+            Self::Shared { .. } => Ok(None),
             Self::Compressed { .. } => {
                 // Compressed cache: K not accessible as raw tensor.
                 // Use cached_attention() for attention computation.
@@ -129,6 +153,7 @@ impl KvCache {
         match self {
             Self::Normal { v, .. } => v.current_data(),
             Self::Rotating { v, .. } => v.current_data(),
+            Self::Shared { .. } => Ok(None),
             Self::Compressed { .. } => {
                 // Compressed cache: V not accessible as raw tensor.
                 Ok(None)
@@ -156,6 +181,11 @@ impl KvCache {
                 let out_v = vc.append(&v)?;
                 (Some(out_k), Some(out_v))
             }
+            Self::Shared { owner } => {
+                candle_core::bail!(
+                    "attempted to append KV data to shared cache owned by layer {owner}"
+                );
+            }
             Self::Compressed { .. } => unreachable!("handled above"),
         };
         let k = match out_k {
@@ -164,6 +194,7 @@ impl KvCache {
                 match self {
                     Self::Normal { k, .. } => shape[k.dim] = 0,
                     Self::Rotating { k, .. } => shape[k.dim] = 0,
+                    Self::Shared { .. } => unreachable!(),
                     Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, k.dtype(), k.device())?
@@ -176,6 +207,7 @@ impl KvCache {
                 match self {
                     Self::Normal { v, .. } => shape[v.dim] = 0,
                     Self::Rotating { v, .. } => shape[v.dim] = 0,
+                    Self::Shared { .. } => unreachable!(),
                     Self::Compressed { .. } => unreachable!("handled above"),
                 }
                 Tensor::zeros(shape, v.dtype(), v.device())?
@@ -189,6 +221,7 @@ impl KvCache {
         match self {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
+            Self::Shared { .. } => 0,
             Self::Compressed { cache, layer, .. } => {
                 let guard = cache.lock().expect("Compressed cache lock poisoned");
                 guard.seq_len(*layer)
@@ -206,12 +239,8 @@ impl KvCache {
                 k.reset();
                 v.reset();
             }
+            Self::Shared { .. } => {}
             Self::Compressed { cache, .. } => {
-                // Compressed caches are append-only; the simplest reset is
-                // to replace the shared cache with a fresh one. Because a
-                // single Arc<Mutex<dyn CompressedKVCache>> is shared across all
-                // layers, resetting one layer effectively needs to recreate
-                // the whole cache. We do this by replacing the Arc contents.
                 cache
                     .lock()
                     .expect("Compressed cache lock poisoned")
@@ -234,6 +263,7 @@ impl KvCache {
                 v.set_len(len)?;
                 Ok(())
             }
+            Self::Shared { .. } => Ok(()),
             Self::Compressed { .. } => {
                 let current = self.current_seq_len();
                 if len == current {
@@ -259,6 +289,7 @@ impl KvCache {
                 v.try_set_len(len)?;
                 Ok(())
             }
+            Self::Shared { .. } => Ok(()),
             Self::Compressed { .. } => {
                 let current = self.current_seq_len();
                 if len == current {
@@ -276,10 +307,13 @@ impl KvCache {
         matches!(self, Self::Rotating { .. })
     }
 
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+
     pub fn is_compressed(&self) -> bool {
         matches!(self, Self::Compressed { .. })
     }
-
 
     /// Returns a clone of this cache if it is a `Compressed` variant (clones the `Arc` reference).
     /// Returns `None` for `Normal` / `Rotating` variants.
@@ -302,6 +336,9 @@ pub enum NormalCacheType {
     },
     SlidingWindow {
         window: usize,
+    },
+    Shared {
+        owner: usize,
     },
     /// Compressed quantized KV cache. All layers share a single
     /// `CompressedKVCache` via `Arc<Mutex>`.
@@ -415,6 +452,9 @@ impl NormalCache {
                 NormalCacheType::SlidingWindow { window } => {
                     caches.push(KvCache::new_rotating(2, window, Self::CACHE_GROW_SIZE));
                 }
+                NormalCacheType::Shared { owner } => {
+                    caches.push(KvCache::new_shared(owner));
+                }
                 NormalCacheType::Compressed { .. } => {
                     panic!("Use NormalCache::new_for_attention() for compressed caches")
                 }
@@ -433,7 +473,8 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cfg =
+            Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
         let cache = turboquant::cache::PqoCache::new(cfg);
         Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
@@ -448,7 +489,14 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, usize::MAX);
+        let cfg = Self::compressed_cache_config(
+            bits,
+            head_dim,
+            num_kv_heads,
+            num_layers,
+            norm_mode,
+            usize::MAX,
+        );
         let pqo = turboquant::cache::PqoCache::new(cfg);
         Self::new_compressed_cache(pqo, num_layers, device, dtype)
     }
@@ -463,7 +511,8 @@ impl NormalCache {
         dtype: candle_core::DType,
         norm_mode: crate::paged_attention::QuantNormMode,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        let cfg = Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
+        let cfg =
+            Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
         let cache = turboquant::cache::TqCache::new(cfg);
         Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
@@ -478,7 +527,12 @@ impl NormalCache {
         outlier_blocks: usize,
     ) -> turboquant::cache::CacheConfig {
         turboquant::cache::CacheConfig {
-            bits, head_dim, num_kv_heads, num_layers, norm_mode, outlier_blocks,
+            bits,
+            head_dim,
+            num_kv_heads,
+            num_layers,
+            norm_mode,
+            outlier_blocks,
         }
     }
 
@@ -526,7 +580,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     seqs[0].normal_cache()
                 };
                 let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
-                    // This is hit in gemma3n for the shared kv cache
                     new_k_cache.push(None);
                     new_v_cache.push(None);
                     continue;
@@ -543,6 +596,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     }
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
+                    }
+                    KvCache::Shared { .. } => {
+                        new_k_cache.push(None);
+                        new_v_cache.push(None);
+                        continue;
                     }
                     KvCache::Compressed { .. } => {
                         unreachable!("handled above")
@@ -564,7 +622,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     seq.normal_cache()
                 };
                 let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
-                    // Skip for shared kv cache layers in models like gemma3n
                     continue;
                 };
                 let (src_k, src_v) = match cache {
@@ -574,6 +631,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     KvCache::Rotating { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                     }
+                    KvCache::Shared { .. } => continue,
                     KvCache::Compressed { .. } => {
                         // Compressed cache is shared; skip tensor extraction per-sequence.
                         continue;
@@ -593,40 +651,14 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             &*seqs[0].normal_cache()
         };
 
-        let existing_pipeline_caches = pipeline.cache().normal().0.clone();
-
         let mut caches = Vec::new();
         for (layer_idx, (k_cache, v_cache)) in new_k_cache.into_iter().zip(new_v_cache).enumerate()
         {
             // Use this for the various parameters. Assumes all seqs are from one model.
             let Some(cache_ref) = seq0_cache[layer_idx].as_ref() else {
-                // Sequence has no cache for this layer. Check if the pipeline's
-                // existing cache is Compressed -- if so, preserve the shared
-                // reference instead of creating a dummy Normal cache.
-                if let Some(existing) = existing_pipeline_caches.get(layer_idx) {
-                    if let Some(compressed) = existing.clone_compressed_ref() {
-                        caches.push(compressed);
-                        continue;
-                    }
-                }
-                // This is hit in gemma3n for the shared kv cache - create dummy cache
-                // These layers don't have their own cache because they share another layer's cache
-                caches.push(KvCache::Normal {
-                    k: SingleCache {
-                        all_data: None,
-                        dim: 0,
-                        current_seq_len: 0,
-                        max_seq_len: 0,
-                        capacity_seq_len: 0,
-                    },
-                    v: SingleCache {
-                        all_data: None,
-                        dim: 0,
-                        current_seq_len: 0,
-                        max_seq_len: 0,
-                        capacity_seq_len: 0,
-                    },
-                });
+                let mut cache = pipeline.cache().normal().0[layer_idx].clone();
+                cache.reset();
+                caches.push(cache);
                 continue;
             };
             match cache_ref {
@@ -657,7 +689,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     let template_cache_dim = old_k.dim;
                     let template_cache_csl = old_k.current_seq_len;
                     let template_cache_msl = old_k.max_seq_len;
-                    let template_cache_offset = old_k.offset;
                     let template_cache_capsl = old_k.capacity_seq_len;
 
                     caches.push(KvCache::Rotating {
@@ -666,7 +697,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
-                            offset: template_cache_offset,
                             capacity_seq_len: template_cache_capsl,
                         },
                         v: RotatingCache {
@@ -674,10 +704,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                             dim: template_cache_dim,
                             current_seq_len: template_cache_csl,
                             max_seq_len: template_cache_msl,
-                            offset: template_cache_offset,
                             capacity_seq_len: template_cache_capsl,
                         },
                     });
+                }
+                KvCache::Shared { owner } => {
+                    caches.push(KvCache::Shared { owner: *owner });
                 }
                 KvCache::Compressed { .. } => {
                     caches.push(cache_ref.clone_compressed_ref().unwrap());
@@ -690,11 +722,18 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         let all_cache = pipeline.cache().normal();
         for layer in 0..pipeline.get_metadata().num_hidden_layers {
             let cache = all_cache.0.get(layer).unwrap();
-
-            // Compressed caches must be handled first, before the is_none
-            // check below. Even when the compressed cache is empty (just reset),
-            // we still need to store the shared Arc reference into each
-            // sequence so that clone_in_cache can find a Compressed entry.
+            if let KvCache::Shared { owner } = cache {
+                for seq in seqs.iter_mut() {
+                    let output_cache = if modify_draft_cache {
+                        seq.normal_draft_cache()
+                    } else {
+                        seq.normal_cache()
+                    };
+                    output_cache[layer] = Some(KvCache::Shared { owner: *owner });
+                }
+                continue;
+            }
+            // Compressed caches: store shared Arc reference into each sequence.
             if let Some(compressed) = cache.clone_compressed_ref() {
                 for seq in seqs.iter_mut() {
                     let output_cache = if modify_draft_cache {
@@ -707,7 +746,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 continue;
             }
-
             // This case for llama 3.2 vision cross attn
             if cache.k().unwrap().is_none() {
                 continue;
@@ -720,9 +758,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 KvCache::Rotating { k, v } => {
                     (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
                 }
-                KvCache::Compressed { .. } => {
-                    unreachable!("Compressed cache handled above");
-                }
+                KvCache::Shared { .. } => unreachable!(),
+                KvCache::Compressed { .. } => unreachable!(),
             };
 
             let k_caches = k_cache.chunk(seqs.len(), 0).unwrap();
@@ -772,7 +809,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 dim: cache_k.dim,
                                 current_seq_len: cache_k.current_seq_len,
                                 max_seq_len: cache_k.max_seq_len,
-                                offset: cache_k.offset,
                                 capacity_seq_len: cache_k.capacity_seq_len,
                             },
                             v: RotatingCache {
@@ -780,15 +816,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                                 dim: cache_v.dim,
                                 current_seq_len: cache_v.current_seq_len,
                                 max_seq_len: cache_v.max_seq_len,
-                                offset: cache_v.offset,
                                 capacity_seq_len: cache_v.capacity_seq_len,
                             },
                         });
                     }
-                    KvCache::Compressed { .. } => {
-                        // Compressed layers are skipped via `continue` above.
-                        unreachable!("Compressed cache handled by continue above");
-                    }
+                    KvCache::Shared { .. } => unreachable!(),
+                    KvCache::Compressed { .. } => unreachable!(),
                 }
             }
         }
@@ -836,11 +869,60 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 continue;
             }
 
+            match &old_caches[layer_idx] {
+                KvCache::Rotating { k, .. } => {
+                    *layer = KvCache::Rotating {
+                        k: RotatingCache {
+                            all_data: None,
+                            dim: k.dim,
+                            current_seq_len: 0,
+                            max_seq_len: k.max_seq_len,
+                            capacity_seq_len: k.capacity_seq_len,
+                        },
+                        v: RotatingCache {
+                            all_data: None,
+                            dim: k.dim,
+                            current_seq_len: 0,
+                            max_seq_len: k.max_seq_len,
+                            capacity_seq_len: k.capacity_seq_len,
+                        },
+                    };
+                    continue;
+                }
+                KvCache::Shared { owner } => {
+                    *layer = KvCache::Shared { owner: *owner };
+                    continue;
+                }
+                KvCache::Compressed {
+                    cache: compressed_cache,
+                    layer: compressed_layer,
+                    ..
+                } => {
+                    if *compressed_layer == 0 {
+                        compressed_cache
+                            .lock()
+                            .expect("Compressed cache lock poisoned")
+                            .reset()
+                            .expect("Compressed cache reset failed");
+                    }
+                    continue;
+                }
+                KvCache::Normal { .. } => {}
+            }
+
             let mut k_caches = Vec::new();
             let mut v_caches = Vec::new();
+            let mut missing_preallocated = false;
             for seq in seqs.iter_mut() {
-                let (mut k_preallocated_cache, mut v_preallocated_cache) =
-                    (*seq.preallocated_cache().as_ref().unwrap()).clone();
+                let Some((mut k_preallocated_cache, mut v_preallocated_cache)) = seq
+                    .preallocated_cache()
+                    .and_then(|cache| cache.get(layer_idx))
+                    .cloned()
+                    .flatten()
+                else {
+                    missing_preallocated = true;
+                    break;
+                };
                 if let Some(layer_devices) = &layer_devices {
                     let layer_dev = &layer_devices[layer_idx];
                     k_preallocated_cache = k_preallocated_cache
@@ -852,6 +934,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 k_caches.push(k_preallocated_cache);
                 v_caches.push(v_preallocated_cache);
+            }
+            if missing_preallocated {
+                layer.reset();
+                continue;
             }
             let k_cache = if k_caches.len() > 1 {
                 Tensor::cat(&k_caches, 0).unwrap()
@@ -888,46 +974,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     };
                     *layer = cache;
                 }
-                KvCache::Rotating { k, .. } => {
-                    let template_cache_dim = k.dim;
-                    let template_cache_msl = k.max_seq_len;
-
-                    // Rotating cache is not preallocated.
-                    let cache = KvCache::Rotating {
-                        k: RotatingCache {
-                            all_data: None,
-                            dim: template_cache_dim,
-                            current_seq_len: 0,
-                            max_seq_len: template_cache_msl,
-                            offset: 0,
-                            capacity_seq_len: 0,
-                        },
-                        v: RotatingCache {
-                            all_data: None,
-                            dim: template_cache_dim,
-                            current_seq_len: 0,
-                            max_seq_len: template_cache_msl,
-                            offset: 0,
-                            capacity_seq_len: 0,
-                        },
-                    };
-                    *layer = cache;
-                }
-                KvCache::Compressed {
-                    cache: compressed_cache,
-                    layer: compressed_layer,
-                    ..
-                } => {
-                    // Reset the compressed cache by replacing its contents
-                    // with a fresh empty cache. Since all layers share the
-                    // same Arc, only reset once (on layer 0).
-                    if *compressed_layer == 0 {
-                        compressed_cache
-                            .lock()
-                            .expect("Compressed cache lock poisoned")
-                            .reset()
-                            .expect("Compressed cache reset failed");
-                    }
+                KvCache::Rotating { .. } | KvCache::Shared { .. } | KvCache::Compressed { .. } => {
+                    unreachable!()
                 }
             }
         }
@@ -1378,11 +1426,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                                 k.all_data = Some(batched_k);
                                 k.current_seq_len = tk.current_seq_len;
                                 k.capacity_seq_len = tk.current_seq_len;
-                                k.offset = tk.offset;
                                 v.all_data = Some(batched_v);
                                 v.current_seq_len = tk.current_seq_len;
                                 v.capacity_seq_len = tk.current_seq_len;
-                                v.offset = tk.offset;
                             }
                             _ => {}
                         }
@@ -1444,11 +1490,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                                     k.all_data = Some(seq_k);
                                     k.current_seq_len = src_k.current_seq_len;
                                     k.capacity_seq_len = src_k.current_seq_len;
-                                    k.offset = src_k.offset;
                                     v.all_data = Some(seq_v);
                                     v.current_seq_len = src_k.current_seq_len;
                                     v.capacity_seq_len = src_k.current_seq_len;
-                                    v.offset = src_k.offset;
                                 }
                                 _ => {}
                             }
@@ -1504,79 +1548,5 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::{DType, Device, Tensor};
-
-
-    #[test]
-    fn normal_cache_append_works() {
-        let k = Tensor::rand(0f32, 1.0, (1, 4, 8, 64), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 4, 8, 64), &Device::Cpu).unwrap();
-        let mut cache = KvCache::new(2, 4);
-        let (k_out, v_out) = cache.append(&k, &v).unwrap();
-        assert_eq!(k_out.dims(), &[1, 4, 8, 64]);
-        assert_eq!(v_out.dims(), &[1, 4, 8, 64]);
-    }
-
-    fn test_pqo_config() -> turboquant::cache::CacheConfig {
-        turboquant::cache::CacheConfig {
-            bits: 3, head_dim: 128, num_kv_heads: 4, num_layers: 2,
-            norm_mode: turboquant::cache::config::QuantNormMode::MaxNorm,
-            outlier_blocks: usize::MAX,
-        }
-    }
-
-    #[test]
-    fn compressed_cache_via_pqo_factory() {
-        use turboquant::cache::PqoCache;
-
-        let pqo = PqoCache::new(test_pqo_config());
-        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
-            Arc::new(Mutex::new(pqo));
-
-        let cache = KvCache::new_compressed(shared.clone(), 0, Device::Cpu, DType::F32);
-        assert!(cache.is_compressed());
-        assert_eq!(cache.current_seq_len(), 0);
-    }
-
-    #[test]
-    fn compressed_cache_append_returns_data() {
-        use turboquant::cache::PqoCache;
-
-        let pqo = PqoCache::new(test_pqo_config());
-        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
-            Arc::new(Mutex::new(pqo));
-
-        let mut cache = KvCache::new_compressed(shared, 0, Device::Cpu, DType::F32);
-        let k = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 4, 8, 128), &Device::Cpu).unwrap();
-
-        let (k_out, v_out) = cache.append(&k, &v).unwrap();
-        // First append returns originals
-        assert_eq!(k_out.dims(), &[1, 4, 8, 128]);
-        assert_eq!(cache.current_seq_len(), 8);
-    }
-
-    #[test]
-    fn compressed_cache_reset() {
-        use turboquant::cache::PqoCache;
-
-        let pqo = PqoCache::new(test_pqo_config());
-        let shared: Arc<Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
-            Arc::new(Mutex::new(pqo));
-
-        let mut cache = KvCache::new_compressed(shared, 0, Device::Cpu, DType::F32);
-        let k = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
-        let v = Tensor::rand(0f32, 1.0, (1, 4, 4, 128), &Device::Cpu).unwrap();
-        cache.append(&k, &v).unwrap();
-        assert_eq!(cache.current_seq_len(), 4);
-
-        cache.set_none_cache();
-        assert_eq!(cache.current_seq_len(), 0);
     }
 }

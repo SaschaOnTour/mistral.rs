@@ -317,11 +317,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                crate::attention::cached_attention(
-                    kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params),
-                )?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
@@ -696,35 +700,16 @@ impl Model {
             kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
-        let cache = if matches!(
-            attention_mechanism,
-            AttentionImplementation::PolarQuant(_, _)
-                | AttentionImplementation::PolarQuantOutlier(_, _)
-                | AttentionImplementation::TurboQuant(_, _)
-        ) {
-            EitherCache::Normal(NormalCache::new_for_attention(
-                &attention_mechanism,
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                cfg.sliding_window,
-                head_dim,
-                cfg.num_key_value_heads,
-                normal_loading_metadata.real_device.clone(),
-                candle_core::DType::F32,
-            ))
-        } else {
-            let cache_types: Vec<NormalCacheType> = (0..cfg.num_hidden_layers)
-                .map(|layer_idx| match cfg.layer_types.get(layer_idx) {
-                    Some(LayerType::SlidingAttention) => NormalCacheType::SlidingWindow {
-                        window: cfg.sliding_window.unwrap_or(cfg.max_position_embeddings),
-                    },
-                    _ => NormalCacheType::Normal {
-                        max_seq_len: cfg.max_position_embeddings,
-                    },
-                })
-                .collect();
-            EitherCache::Normal(NormalCache::from_types(cache_types))
-        };
+        let cache_types: Vec<NormalCacheType> = (0..cfg.num_hidden_layers)
+            .map(|layer_idx| match cfg.layer_types.get(layer_idx) {
+                Some(LayerType::SlidingAttention) => NormalCacheType::SlidingWindow {
+                    window: cfg.sliding_window.unwrap_or(cfg.max_position_embeddings),
+                },
+                _ => NormalCacheType::Normal {
+                    max_seq_len: cfg.max_position_embeddings,
+                },
+            })
+            .collect();
 
         Ok(Self {
             embed_tokens,
@@ -732,7 +717,7 @@ impl Model {
             norm,
             lm_head,
             device: normal_loading_metadata.real_device,
-            cache,
+            cache: EitherCache::Normal(NormalCache::from_types(cache_types)),
             max_seq_len: cfg.max_position_embeddings,
             mapper,
             cfg: cfg.clone(),

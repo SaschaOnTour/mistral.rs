@@ -24,7 +24,7 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, VisionModel,
+        EitherCache, IsqModel, KvCache, MultimodalModel, NormalCache, NormalLoadingMetadata,
     },
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
@@ -179,9 +179,15 @@ impl Attention {
                     )?
                 }
             },
-            None => {
-                crate::attention::cached_attention(kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, Some(flash_params))?
-            }
+            None => crate::attention::cached_attention(
+                kv_cache,
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                &self.sdpa_params,
+                Some(flash_params),
+            )?,
         };
 
         if let Some(t) = self.qkv_proj.quantized_act_type() {
@@ -558,7 +564,7 @@ pub(crate) struct Phi4MMVisionSpecificArgs {
     pub image_hashes: Vec<u64>,
 }
 
-impl VisionModel for Phi4MMModel {
+impl MultimodalModel for Phi4MMModel {
     fn forward(
         &self,
         input_ids: &Tensor,

@@ -103,7 +103,13 @@ impl EncoderAttention {
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
         let attn_output = crate::attention::cached_attention(
-            kv_cache, &q, &k, &v, attention_mask, &self.sdpa_params, None,
+            kv_cache,
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            &self.sdpa_params,
+            None,
         )?;
 
         let attn_output = if attention_mask.is_some() {

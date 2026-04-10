@@ -191,16 +191,17 @@ impl Sdpa {
                 && sdpa_params.softcap.is_none_or(|x| x == 1.0)
         });
         let valid_head_dims: &[usize] = if seq_len == 1 {
-            &[32, 64, 72, 80, 96, 128, 256]
+            &[32, 64, 72, 80, 96, 128, 256, 512]
         } else {
-            // Not sure why the full kernel doesn't like 256.
-            // [32, 64, 72, 80, 96, 128, 256]
-            &[32, 64, 72, 80, 96, 128]
+            &[32, 64, 72, 80, 96, 128, 256, 512]
         };
+        // Metal SDPA full kernel requires q_seq <= k_seq when a mask is present.
+        let metal_supports_mask = mask.is_none() || seq_len <= k.dim(2)?;
         if [q, k, v].into_iter().all(|x| x.device().is_metal())
             && all_head_dims_match
             && valid_head_dims.contains(&head_dim)
             && can_use_mask
+            && metal_supports_mask
         {
             let mask = match mask {
                 Some(mask) => Some(mask.broadcast_as(tgt_mask_shape)?),
@@ -399,34 +400,9 @@ pub fn cached_attention(
     }
 
     // Normal / Rotating cache: standard path
+    // Note: RotatingCache handles prefill reordering internally via prefill_full_kv,
+    // so no manual reorder of circular-buffer data is needed here.
     let (k_out, v_out) = kv_cache.append(k, v)?;
-
-    // For rotating (sliding-window) caches that have wrapped around during
-    // prefill (q_len > 1), the returned K/V are in circular-buffer order.
-    // Reorder to temporal order so the mask columns align correctly.
-    let q_len = q.dim(2)?;
-    let (k_out, v_out) = if q_len > 1 {
-        match kv_cache {
-            KvCache::Rotating { k: kc, .. }
-                if kc.current_seq_len >= kc.max_seq_len && kc.offset > 0 =>
-            {
-                let dim = 2; // (batch, heads, seq, head_dim)
-                let offset = kc.offset;
-                let max_len = kc.max_seq_len;
-                let p1_k = k_out.narrow(dim, offset, max_len - offset)?;
-                let p2_k = k_out.narrow(dim, 0, offset)?;
-                let p1_v = v_out.narrow(dim, offset, max_len - offset)?;
-                let p2_v = v_out.narrow(dim, 0, offset)?;
-                (
-                    Tensor::cat(&[&p1_k, &p2_k], dim)?,
-                    Tensor::cat(&[&p1_v, &p2_v], dim)?,
-                )
-            }
-            _ => (k_out, v_out),
-        }
-    } else {
-        (k_out, v_out)
-    };
 
     Sdpa.run_attention(q, &k_out, &v_out, mask, flash_params, sdpa_params, None)
 }
