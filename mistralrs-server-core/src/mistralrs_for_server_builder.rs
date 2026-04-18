@@ -1118,7 +1118,11 @@ fn init_cache_config(
     // exhaust VRAM. When absent, fall back to a high but finite upper bound.
     if cache_type.is_compressed_cache() {
         const COMPRESSED_CACHE_DEFAULT_CONTEXT: usize = 65_536;
-        let ctx = paged_ctxt_len.unwrap_or(COMPRESSED_CACHE_DEFAULT_CONTEXT);
+        // Treat an explicit Some(0) the same as None: zero would reintroduce the
+        // unbounded-allocation footgun we're trying to close here.
+        let ctx = paged_ctxt_len
+            .filter(|n| *n > 0)
+            .unwrap_or(COMPRESSED_CACHE_DEFAULT_CONTEXT);
         return Ok(Some(PagedAttentionConfig::new(
             paged_attn_block_size,
             MemoryGpuConfig::ContextSize(ctx),
