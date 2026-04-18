@@ -1,7 +1,7 @@
 use candle_core::{Device, Result};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     kv_cache::RecurrentStateSnapshot, paged_attention::block_hash::BlockHash, pipeline::KvCache,
@@ -101,6 +101,24 @@ impl PrefixCacheManagerV2 {
         // PrefixCacheManagerV2 only handles non-paged attention caching.
         if !self.has_paged_attention {
             let cache = seq.normal_cache().to_vec();
+
+            // Prefix caching cannot replay a compressed (quantized) KV cache without
+            // full dequantization. Warn once and skip insert so stale cache entries
+            // don't accumulate unused memory.
+            let has_compressed = cache
+                .iter()
+                .flatten()
+                .any(|layer| matches!(layer, KvCache::Compressed { .. }));
+            if has_compressed {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    warn!(
+                        "Prefix caching is not supported with compressed KV cache (PolarQuant/TurboQuant) \
+                         and is effectively disabled. Pass --no-prefix-cache to silence this warning."
+                    );
+                });
+                return;
+            }
 
             self.caches.insert(
                 seq.get_toks().to_vec().into(),

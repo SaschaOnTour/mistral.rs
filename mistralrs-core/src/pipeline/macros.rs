@@ -593,6 +593,7 @@ macro_rules! normal_model_loader {
             |_| true, // Will be overwritten...
             get_device_for_tensor,
         )?;
+        let _real_dtype = vb.dtype();
 
         $loader.load(
             &$config,
@@ -603,6 +604,7 @@ macro_rules! normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: _real_dtype,
             },
             $attention_mechanism,
         )?
@@ -614,6 +616,7 @@ macro_rules! normal_model_loader {
 macro_rules! normal_model_loader_sharded {
     (
         $vb:expr,
+        $dtype:expr,
         $config:expr,
         $loader:expr,
         $mapper:expr,
@@ -632,6 +635,7 @@ macro_rules! normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: $dtype,
             },
             $attention_mechanism,
         )?
@@ -682,6 +686,7 @@ macro_rules! multimodal_normal_model_loader {
             |_| true, // Will be overwritten...
             get_device_for_tensor,
         )?;
+        let _real_dtype = vb.dtype();
 
         $loader.load(
             &$config,
@@ -692,6 +697,7 @@ macro_rules! multimodal_normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: _real_dtype,
             },
             $attention_mechanism,
         )?
@@ -703,6 +709,7 @@ macro_rules! multimodal_normal_model_loader {
 macro_rules! multimodal_normal_model_loader_sharded {
     (
         $vb:expr,
+        $dtype:expr,
         $config:expr,
         $loader:expr,
         $mapper:expr,
@@ -721,6 +728,7 @@ macro_rules! multimodal_normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: $dtype,
             },
             $attention_mechanism,
         )?
@@ -765,6 +773,7 @@ macro_rules! embedding_normal_model_loader {
             |_| true, // Will be overwritten...
             get_device_for_tensor,
         )?;
+        let _real_dtype = vb.dtype();
 
         $loader.load(
             &$config,
@@ -775,6 +784,7 @@ macro_rules! embedding_normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: None,
+                real_dtype: _real_dtype,
             },
             $attention_mechanism,
         )?
@@ -786,6 +796,7 @@ macro_rules! embedding_normal_model_loader {
 macro_rules! embedding_normal_model_loader_sharded {
     (
         $vb:expr,
+        $dtype:expr,
         $config:expr,
         $loader:expr,
         $mapper:expr,
@@ -803,6 +814,7 @@ macro_rules! embedding_normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: None,
+                real_dtype: $dtype,
             },
             $attention_mechanism,
         )?
@@ -863,6 +875,7 @@ macro_rules! xlora_model_loader {
             |_| true,
             get_device_for_tensor,
         )?;
+        let _real_dtype = vb.dtype();
 
         $loader.load_xlora(
             &$config,
@@ -876,6 +889,7 @@ macro_rules! xlora_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: _real_dtype,
             },
             &None,
         )?
@@ -931,6 +945,7 @@ macro_rules! lora_model_loader {
             |_| true, // Will be overwritten...
             get_device_for_tensor.clone(),
         )?;
+        let _real_dtype = vb.dtype();
 
         for $crate::pipeline::LoraAdapterPaths {
             adapter_path,
@@ -964,6 +979,7 @@ macro_rules! lora_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                real_dtype: _real_dtype,
             },
             $attention_mechanism,
         )?

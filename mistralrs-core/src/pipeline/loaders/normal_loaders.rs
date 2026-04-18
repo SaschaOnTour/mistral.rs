@@ -87,6 +87,9 @@ pub struct NormalLoadingMetadata {
     pub multi_progress: Arc<MultiProgress>,
     // Optional Matryoshka Transformer slicing configuration
     pub matformer_slicing_config: Option<MatformerSliceConfig>,
+    // Activation dtype the model runs in (BF16/F16/F32). Used so caches and
+    // auxiliary buffers can match the model rather than hardcoding F32.
+    pub real_dtype: candle_core::DType,
 }
 
 pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoader {
@@ -110,6 +113,16 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
     ) -> Result<Box<dyn NormalModel + Send + Sync>>;
     fn is_gptx(&self, config: &str) -> Result<bool>;
     fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
+        Ok(true)
+    }
+    /// Whether this model can use a compressed (quantized) KV cache such as
+    /// PolarQuant / TurboQuant. Returns `false` for models whose attention
+    /// architecture is incompatible with block-wise KV quantization — in
+    /// particular MLA models (DeepSeekV2/V3) that carry a latent KV space
+    /// whose dimensions do not match the codebook assumptions.
+    ///
+    /// Loaders must override this explicitly when the default (`true`) is wrong.
+    fn supports_compressed_cache(&self, _config: &str) -> Result<bool> {
         Ok(true)
     }
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>>;
@@ -372,6 +385,9 @@ impl NormalModelLoader for AutoNormalLoader {
     }
     fn supports_paged_attention(&self, config: &str) -> Result<bool> {
         Self::get_loader(config)?.supports_paged_attention(config)
+    }
+    fn supports_compressed_cache(&self, config: &str) -> Result<bool> {
+        Self::get_loader(config)?.supports_compressed_cache(config)
     }
     fn is_gptx(&self, config: &str) -> Result<bool> {
         Self::get_loader(config)?.is_gptx(config)
@@ -2471,6 +2487,10 @@ impl NormalModelLoader for DeepSeekV2Loader {
         let cfg: crate::models::deepseek2::DeepSeekV2Config = serde_json::from_str(config)?;
         Ok(Box::new(cfg))
     }
+    fn supports_compressed_cache(&self, _config: &str) -> Result<bool> {
+        // MLA uses a latent KV space incompatible with block-wise quantization.
+        Ok(false)
+    }
 }
 
 impl IsqModelLoader for DeepSeekV2Loader {
@@ -2798,6 +2818,10 @@ impl NormalModelLoader for DeepSeekV3Loader {
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
         let cfg: crate::models::deepseek3::DeepSeekV3Config = serde_json::from_str(config)?;
         Ok(Box::new(cfg))
+    }
+    fn supports_compressed_cache(&self, _config: &str) -> Result<bool> {
+        // MLA uses a latent KV space incompatible with block-wise quantization.
+        Ok(false)
     }
 }
 

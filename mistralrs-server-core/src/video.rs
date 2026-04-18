@@ -119,11 +119,9 @@ fn decode_gif_frames(bytes: &[u8], num_frames: usize) -> Result<VideoInput> {
         .iter()
         .map(|f| {
             let (num, den) = f.delay().numer_denom_ms();
-            if den == 0 {
-                100
-            } else {
-                num * 1000 / den
-            }
+            num.checked_mul(1000)
+                .and_then(|x| x.checked_div(den))
+                .unwrap_or(100)
         })
         .sum();
     let fps = if total_delay_ms > 0 {

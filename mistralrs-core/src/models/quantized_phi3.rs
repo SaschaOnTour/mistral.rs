@@ -361,8 +361,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 head_dim,
                 head_count_kv,
                 device.clone(),
-                candle_core::DType::F32,
-            )),
+                dtype,
+            )?),
             max_seq_len: context_window,
             dtype,
         })

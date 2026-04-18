@@ -362,9 +362,22 @@ class Which(Enum):
         dac_model_id: str | None = None
         dtype: ModelDType = ModelDType.Auto
 
-class PagedCacheType(Enum):
-    Auto: int = 0
-    F8E4M3: int = 1
+class PagedCacheType:
+    """Backwards-compatible cache type selector.
+
+    The Rust ``pa_cache_type`` API accepts plain strings. These class
+    attributes resolve to the string values for convenience and source
+    compatibility with older Python code that used ``PagedCacheType.PQ3``.
+    """
+
+    Auto: str = "auto"
+    F8E4M3: str = "f8e4m3"
+    PQ3: str = "pq3"
+    PQ4: str = "pq4"
+    PQO3: str = "pqo3"
+    PQO4: str = "pqo4"
+    TQ3: str = "tq3"
+    TQ4: str = "tq4"
 
 class Runner:
     def __init__(
@@ -383,7 +396,7 @@ class Runner:
         anymoe_config: AnyMoeConfig | None = None,
         pa_gpu_mem: int | float | None = None,
         pa_blk_size: int | None = None,
-        pa_cache_type: PagedCacheType | None = None,
+        pa_cache_type: PagedCacheType | str | None = None,
         no_paged_attn: bool = False,
         paged_attn: bool = False,
         seed: int | None = None,
