@@ -131,7 +131,7 @@ impl SearchPipeline {
                     .to_dtype(DType::F32)?
                     .to_device(&Device::Cpu)?
                     .to_vec2::<f32>()?;
-                for ((idx, _), embedding) in chunk_entries.iter().zip(vecs.into_iter()) {
+                for ((idx, _), embedding) in chunk_entries.iter().zip(vecs) {
                     outputs[*idx] = embedding;
                 }
             }
@@ -294,8 +294,7 @@ pub fn rank_document_chunks(
 
     let chunk_embeddings = pipeline.embed(&prompts)?;
     let mut scored = Vec::with_capacity(bindings.len());
-    for ((result_index, chunk), embedding) in bindings.into_iter().zip(chunk_embeddings.into_iter())
-    {
+    for ((result_index, chunk), embedding) in bindings.into_iter().zip(chunk_embeddings) {
         let score = cosine_similarity(&query_embedding, &embedding);
         scored.push(ScoredChunk {
             result_index,

@@ -115,10 +115,8 @@ async fn do_search(
                 })
             });
 
-        let mut combined: Vec<(SearchResult, usize)> = results
-            .into_iter()
-            .zip(result_token_lens.into_iter())
-            .collect();
+        let mut combined: Vec<(SearchResult, usize)> =
+            results.into_iter().zip(result_token_lens).collect();
         combined.sort_by_key(|(_, len)| *len);
         let (results, result_token_lens): (Vec<SearchResult>, Vec<usize>) =
             combined.into_iter().unzip();

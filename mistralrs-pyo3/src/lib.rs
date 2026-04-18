@@ -2433,7 +2433,7 @@ impl From<McpClientConfigPy> for McpClientConfig {
 /// The Rust `PagedCacheType` carries u8 data variants and cannot be exported
 /// as a real pyclass. Python callers used to do `PagedCacheType.Auto` etc.;
 /// with this shim that keeps working because class attributes return the same
-/// string form the Rust API now accepts for `pa_cache_type`.
+/// string format that the Rust API now accepts for `pa_cache_type`.
 #[pyclass(name = "PagedCacheType", frozen)]
 struct PyPagedCacheType;
 

@@ -234,11 +234,13 @@ pub fn get_device_layers(
             let per_token = model_cfg
                 .num_kv_heads()
                 .saturating_mul(model_cfg.k_head_dim() + model_cfg.v_head_dim());
-            let bytes = tokens
+            // Use ceiling division on both bit→byte and byte→element conversions
+            // so the estimate stays a true upper bound (never rounds down).
+            let bits = tokens
                 .saturating_mul(per_token)
-                .saturating_mul(COMPRESSED_BITS_UPPER_BOUND)
-                / 8;
-            bytes / dtype.size_in_bytes().max(1)
+                .saturating_mul(COMPRESSED_BITS_UPPER_BOUND);
+            let bytes = bits.div_ceil(8);
+            bytes.div_ceil(dtype.size_in_bytes().max(1))
         }
         Some(cfg) => {
             // For MbAmount, clamp to available memory so the capacity check
