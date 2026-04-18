@@ -329,7 +329,15 @@ impl Loader for NormalLoader {
         let is_compressed_early = paged_attn_config
             .as_ref()
             .is_some_and(|c| c.cache_type.is_compressed_cache());
-        if !self.inner.supports_paged_attention(&config)? && !is_compressed_early {
+        if !self.inner.supports_paged_attention(&config)? {
+            if is_compressed_early {
+                anyhow::bail!(
+                    "Compressed KV cache is not supported for this model. \
+                     DeepSeek MLA models (deepseek2/3) use a latent KV space that is \
+                     incompatible with block-wise quantization. Use --pa-cache-type auto \
+                     or omit --pa-cache-type."
+                );
+            }
             paged_attn_config = None;
         }
 
@@ -677,6 +685,7 @@ impl Loader for NormalLoader {
             match self.kind {
                 ModelKind::Normal => normal_model_loader_sharded!(
                     sharded_vb,
+                    dtype,
                     config,
                     self.inner,
                     mapper,

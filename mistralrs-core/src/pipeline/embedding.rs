@@ -542,6 +542,7 @@ impl Loader for EmbeddingLoader {
             match self.kind {
                 ModelKind::Normal => embedding_normal_model_loader_sharded!(
                     sharded_vb,
+                    dtype,
                     config,
                     self.inner,
                     mapper,

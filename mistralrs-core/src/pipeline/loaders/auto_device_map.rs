@@ -224,10 +224,21 @@ pub fn get_device_layers(
     let model_cfg = loader.model_config(config)?;
     let kv_cache_elems = match paged_attn_config {
         Some(cfg) if cfg.cache_type.is_compressed_cache() => {
-            // Compressed cache manages its own storage — no paged attention blocks needed.
-            // Estimate KV cache size as zero for device mapping purposes;
-            // the compressed cache allocates dynamically during inference.
-            0
+            // Compressed cache grows dynamically during inference. A rough upper-bound
+            // estimate prevents unbounded VRAM use under adversarial long-context requests.
+            // Formula: max_tokens * num_kv_heads * (k_head + v_head) * 4 bits / 8, expressed
+            // in activation-dtype elements. 4 bits is the worst case for the supported
+            // cache types (PQ3/PQ4/PQO3/PQO4/TQ3/TQ4 all pack 2–4 bits per element).
+            const COMPRESSED_BITS_UPPER_BOUND: usize = 4;
+            let tokens = max_seq_len.saturating_mul(max_batch_size);
+            let per_token = model_cfg
+                .num_kv_heads()
+                .saturating_mul(model_cfg.k_head_dim() + model_cfg.v_head_dim());
+            let bytes = tokens
+                .saturating_mul(per_token)
+                .saturating_mul(COMPRESSED_BITS_UPPER_BOUND)
+                / 8;
+            bytes / dtype.size_in_bytes().max(1)
         }
         Some(cfg) => {
             // For MbAmount, clamp to available memory so the capacity check

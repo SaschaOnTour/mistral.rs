@@ -87,6 +87,9 @@ pub struct NormalLoadingMetadata {
     pub multi_progress: Arc<MultiProgress>,
     // Optional Matryoshka Transformer slicing configuration
     pub matformer_slicing_config: Option<MatformerSliceConfig>,
+    // Activation dtype the model runs in (BF16/F16/F32). Used so caches and
+    // auxiliary buffers can match the model rather than hardcoding F32.
+    pub real_dtype: candle_core::DType,
 }
 
 pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoader {

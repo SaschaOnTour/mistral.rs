@@ -571,8 +571,8 @@ impl Model {
                 cfg.head_dim(),
                 (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size()).max(1),
                 normal_loading_metadata.real_device.clone(),
-                candle_core::DType::F32,
-            ))
+                normal_loading_metadata.real_dtype,
+            )?)
         } else {
             let cache_types = (0..cfg.num_hidden_layers)
                 .map(|_| {

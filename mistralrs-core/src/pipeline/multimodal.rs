@@ -606,6 +606,7 @@ impl Loader for MultimodalLoader {
             match self.kind {
                 ModelKind::Normal => multimodal_normal_model_loader_sharded!(
                     sharded_vb,
+                    dtype,
                     config,
                     self.inner,
                     mapper,

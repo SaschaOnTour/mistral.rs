@@ -2428,11 +2428,42 @@ impl From<McpClientConfigPy> for McpClientConfig {
     }
 }
 
+/// Backwards-compatible shim for the old Python `PagedCacheType` enum.
+///
+/// The Rust `PagedCacheType` carries u8 data variants and cannot be exported
+/// as a real pyclass. Python callers used to do `PagedCacheType.Auto` etc.;
+/// with this shim that keeps working because class attributes return the same
+/// string form the Rust API now accepts for `pa_cache_type`.
+#[pyclass(name = "PagedCacheType", frozen)]
+struct PyPagedCacheType;
+
+#[pymethods]
+#[allow(non_upper_case_globals)]
+impl PyPagedCacheType {
+    #[classattr]
+    const Auto: &'static str = "auto";
+    #[classattr]
+    const F8E4M3: &'static str = "f8e4m3";
+    #[classattr]
+    const PQ3: &'static str = "pq3";
+    #[classattr]
+    const PQ4: &'static str = "pq4";
+    #[classattr]
+    const PQO3: &'static str = "pqo3";
+    #[classattr]
+    const PQO4: &'static str = "pqo4";
+    #[classattr]
+    const TQ3: &'static str = "tq3";
+    #[classattr]
+    const TQ4: &'static str = "tq4";
+}
+
 #[pymodule]
 fn mistralrs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     initialize_logging();
 
     m.add_class::<Runner>()?;
+    m.add_class::<PyPagedCacheType>()?;
     m.add_class::<Which>()?;
     m.add_class::<ChatCompletionRequest>()?;
     m.add_class::<CompletionRequest>()?;

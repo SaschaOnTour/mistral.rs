@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use candle_core::{Result, Tensor, D};
+use tracing::error;
 
 use crate::{
     get_mut_arcmutex,
@@ -14,6 +15,17 @@ mod rotating_cache;
 mod single_cache;
 
 pub use full_cache::{EitherCache, LayerCaches};
+
+/// Validate that `bits` is in the supported 2..=4 range for compressed caches.
+fn validate_compressed_bits(bits: u8, kind: &str) -> candle_core::Result<()> {
+    if !(2..=4).contains(&bits) {
+        candle_core::bail!(
+            "Unsupported bit width {bits} for {kind} compressed cache (supported: 2, 3, 4)"
+        );
+    }
+    Ok(())
+}
+
 pub use hybrid_cache::{
     HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     RecurrentStateSnapshot,
@@ -222,10 +234,13 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::Shared { .. } => 0,
-            Self::Compressed { cache, layer, .. } => {
-                let guard = cache.lock().expect("Compressed cache lock poisoned");
-                guard.seq_len(*layer)
-            }
+            Self::Compressed { cache, layer, .. } => match cache.lock() {
+                Ok(guard) => guard.seq_len(*layer),
+                Err(e) => {
+                    error!("Compressed cache lock poisoned in current_seq_len: {e}");
+                    0
+                }
+            },
         }
     }
 
@@ -240,13 +255,14 @@ impl KvCache {
                 v.reset();
             }
             Self::Shared { .. } => {}
-            Self::Compressed { cache, .. } => {
-                cache
-                    .lock()
-                    .expect("Compressed cache lock poisoned")
-                    .reset()
-                    .expect("Compressed cache reset failed");
-            }
+            Self::Compressed { cache, .. } => match cache.lock() {
+                Ok(mut guard) => {
+                    if let Err(e) = guard.reset() {
+                        error!("Compressed cache reset failed: {e}");
+                    }
+                }
+                Err(e) => error!("Compressed cache lock poisoned in reset: {e}"),
+            },
         }
     }
 
@@ -394,6 +410,10 @@ impl NormalCache {
     ///
     /// For compressed caches: creates a shared quantized KV cache across all layers.
     /// For `Eager`/`PagedAttention`: delegates to `new_sliding`.
+    ///
+    /// Rejects unsupported combinations for compressed caches:
+    /// - Bit widths outside 2..=4
+    /// - Sliding-window attention (cache layout assumes unbounded growth)
     #[allow(clippy::too_many_arguments)]
     pub fn new_for_attention(
         attention_mechanism: &crate::paged_attention::AttentionImplementation,
@@ -404,41 +424,61 @@ impl NormalCache {
         num_kv_heads: usize,
         device: candle_core::Device,
         dtype: candle_core::DType,
-    ) -> Arc<Mutex<Self>> {
+    ) -> candle_core::Result<Arc<Mutex<Self>>> {
         use crate::paged_attention::AttentionImplementation;
+
+        let is_compressed = matches!(
+            attention_mechanism,
+            AttentionImplementation::PolarQuant(..)
+                | AttentionImplementation::PolarQuantOutlier(..)
+                | AttentionImplementation::TurboQuant(..)
+        );
+        if is_compressed && sliding_window.is_some() {
+            candle_core::bail!(
+                "Compressed KV cache does not support sliding window attention. \
+                 Models with sliding window (Phi3, Gemma2, Mixtral, SmolLM3) must use the standard KV cache."
+            );
+        }
+
         match attention_mechanism {
-            AttentionImplementation::PolarQuant(bits, nm) => Self::new_pq(
-                num_layers,
-                *bits,
-                head_dim,
-                num_kv_heads,
-                device,
-                dtype,
-                *nm,
-            )
-            .expect("Failed to create PQ cache"),
-            AttentionImplementation::PolarQuantOutlier(bits, nm) => Self::new_pqo(
-                num_layers,
-                *bits,
-                head_dim,
-                num_kv_heads,
-                device,
-                dtype,
-                *nm,
-            )
-            .expect("Failed to create PQO cache"),
-            AttentionImplementation::TurboQuant(bits, nm) => Self::new_tq(
-                num_layers,
-                *bits,
-                head_dim,
-                num_kv_heads,
-                device,
-                dtype,
-                *nm,
-            )
-            .expect("Failed to create TQ cache"),
+            AttentionImplementation::PolarQuant(bits, nm) => {
+                validate_compressed_bits(*bits, "PolarQuant")?;
+                Self::new_pq(
+                    num_layers,
+                    *bits,
+                    head_dim,
+                    num_kv_heads,
+                    device,
+                    dtype,
+                    *nm,
+                )
+            }
+            AttentionImplementation::PolarQuantOutlier(bits, nm) => {
+                validate_compressed_bits(*bits, "PolarQuantOutlier")?;
+                Self::new_pqo(
+                    num_layers,
+                    *bits,
+                    head_dim,
+                    num_kv_heads,
+                    device,
+                    dtype,
+                    *nm,
+                )
+            }
+            AttentionImplementation::TurboQuant(bits, nm) => {
+                validate_compressed_bits(*bits, "TurboQuant")?;
+                Self::new_tq(
+                    num_layers,
+                    *bits,
+                    head_dim,
+                    num_kv_heads,
+                    device,
+                    dtype,
+                    *nm,
+                )
+            }
             AttentionImplementation::Eager | AttentionImplementation::PagedAttention => {
-                Self::new_sliding(num_layers, max_seq_len, sliding_window)
+                Ok(Self::new_sliding(num_layers, max_seq_len, sliding_window))
             }
         }
     }
@@ -864,9 +904,21 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
         let old_caches = pipeline.cache().normal().0.clone();
 
+        // Reset the shared compressed cache exactly once per set_none_cache call,
+        // regardless of which layer index is iterated first (robust against multi-GPU
+        // layer-iteration order).
+        let mut compressed_reset = false;
+
         for (layer_idx, layer) in pipeline.cache().normal().0.iter_mut().enumerate() {
             if !load_preallocated_cache {
-                layer.reset();
+                if layer.is_compressed() {
+                    if !compressed_reset {
+                        layer.reset();
+                        compressed_reset = true;
+                    }
+                } else {
+                    layer.reset();
+                }
                 continue;
             }
 
@@ -896,15 +948,20 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 }
                 KvCache::Compressed {
                     cache: compressed_cache,
-                    layer: compressed_layer,
                     ..
                 } => {
-                    if *compressed_layer == 0 {
-                        compressed_cache
-                            .lock()
-                            .expect("Compressed cache lock poisoned")
-                            .reset()
-                            .expect("Compressed cache reset failed");
+                    if !compressed_reset {
+                        match compressed_cache.lock() {
+                            Ok(mut guard) => {
+                                if let Err(e) = guard.reset() {
+                                    error!("Compressed cache reset failed in set_none_cache: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Compressed cache lock poisoned in set_none_cache: {e}")
+                            }
+                        }
+                        compressed_reset = true;
                     }
                     continue;
                 }
@@ -1549,5 +1606,114 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paged_attention::{AttentionImplementation, QuantNormMode};
+
+    fn pq(bits: u8) -> AttentionImplementation {
+        AttentionImplementation::PolarQuant(bits, QuantNormMode::MaxNorm)
+    }
+
+    #[test]
+    fn rejects_invalid_bits_below_range() {
+        let err = NormalCache::new_for_attention(
+            &pq(1),
+            4,
+            4096,
+            None,
+            64,
+            4,
+            candle_core::Device::Cpu,
+            candle_core::DType::F32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("bit width 1"),
+            "expected rejection for bits=1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bits_above_range() {
+        let err = NormalCache::new_for_attention(
+            &pq(5),
+            4,
+            4096,
+            None,
+            64,
+            4,
+            candle_core::Device::Cpu,
+            candle_core::DType::F32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("bit width 5"),
+            "expected rejection for bits=5, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_bits_zero() {
+        for ctor in [
+            AttentionImplementation::PolarQuant(0, QuantNormMode::MaxNorm),
+            AttentionImplementation::PolarQuantOutlier(0, QuantNormMode::MaxNorm),
+            AttentionImplementation::TurboQuant(0, QuantNormMode::MaxNorm),
+        ] {
+            let err = NormalCache::new_for_attention(
+                &ctor,
+                4,
+                4096,
+                None,
+                64,
+                4,
+                candle_core::Device::Cpu,
+                candle_core::DType::F32,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("bit width 0"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_sliding_window_for_compressed() {
+        let err = NormalCache::new_for_attention(
+            &pq(3),
+            4,
+            4096,
+            Some(1024), // sliding window set -> must bail
+            64,
+            4,
+            candle_core::Device::Cpu,
+            candle_core::DType::F32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.to_lowercase().contains("sliding window"),
+            "expected sliding-window rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_sliding_window_for_non_compressed() {
+        // Eager with sliding window must still succeed (falls back to rotating cache).
+        let res = NormalCache::new_for_attention(
+            &AttentionImplementation::Eager,
+            4,
+            4096,
+            Some(1024),
+            64,
+            4,
+            candle_core::Device::Cpu,
+            candle_core::DType::F32,
+        );
+        assert!(res.is_ok(), "eager+sliding_window should be accepted");
     }
 }

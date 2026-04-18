@@ -443,8 +443,8 @@ impl Phi4MMModel {
             cfg.head_dim(),
             cfg.num_key_value_heads(),
             normal_loading_metadata.real_device.clone(),
-            candle_core::DType::F32,
-        ));
+            normal_loading_metadata.real_dtype,
+        )?);
         Ok(Self {
             layers,
             norm,
