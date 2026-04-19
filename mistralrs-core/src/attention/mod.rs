@@ -357,18 +357,17 @@ pub fn cached_attention(
 ) -> Result<Tensor> {
     // Compressed cache: prefill/decode via CompressedKVCache trait.
     // The cache implementation decides internally: fused kernel vs dequant.
+    // The trait handles its own synchronization — per-layer locks inside the
+    // implementation allow concurrent access from different layers.
     if let KvCache::Compressed { cache, layer, .. } = kv_cache {
         let is_decode = k.dim(2)? == 1;
-        let mut guard = cache
-            .lock()
-            .map_err(|e| candle_core::Error::Msg(format!("Compressed cache lock: {e}")))?;
 
         if is_decode {
             let config = mistralrs_kv_cache::AttendConfig {
                 softmax_scale: sdpa_params.softmax_scale,
                 n_kv_groups: sdpa_params.n_kv_groups,
             };
-            return match guard.decode(*layer, k, v, q, &config)? {
+            return match cache.decode(*layer, k, v, q, &config)? {
                 mistralrs_kv_cache::DecodeOutput::Fused(output) => Ok(output),
                 mistralrs_kv_cache::DecodeOutput::Dequantized(result) => Sdpa.run_attention(
                     q,
@@ -383,7 +382,7 @@ pub fn cached_attention(
         }
 
         // Prefill: multiple tokens
-        let result = guard.prefill(*layer, k, v, q)?;
+        let result = cache.prefill(*layer, k, v, q)?;
         return Sdpa.run_attention(
             q,
             &result.k,

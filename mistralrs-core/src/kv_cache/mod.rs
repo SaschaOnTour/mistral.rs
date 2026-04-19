@@ -63,8 +63,9 @@ pub enum KvCache {
         owner: usize,
     },
     Compressed {
-        /// Shared compressed cache via CompressedKVCache trait.
-        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
+        /// Shared compressed cache via CompressedKVCache trait. The trait provides
+        /// per-layer internal locking, so the outer handle is a plain `Arc`.
+        cache: std::sync::Arc<dyn mistralrs_kv_cache::CompressedKVCache>,
         /// Which transformer layer this KvCache instance represents.
         layer: usize,
         /// Original device for the tensors.
@@ -131,11 +132,12 @@ impl KvCache {
 
     /// Creates a new compressed KV cache for a specific layer.
     ///
-    /// The `cache` is a shared `Arc<Mutex<dyn CompressedKVCache>>` that holds
+    /// The `cache` is a shared `Arc<dyn CompressedKVCache>` that holds
     /// compressed data for ALL layers and heads. Each `KvCache::Compressed`
-    /// instance references it with a specific `layer` index.
+    /// instance references it with a specific `layer` index. Interior locking
+    /// inside the trait implementation allows parallel access across layers.
     pub fn new_compressed(
-        cache: std::sync::Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>>,
+        cache: std::sync::Arc<dyn mistralrs_kv_cache::CompressedKVCache>,
         layer: usize,
         device: candle_core::Device,
         dtype: candle_core::DType,
@@ -234,13 +236,7 @@ impl KvCache {
             Self::Normal { k, .. } => k.current_seq_len(),
             Self::Rotating { k, .. } => k.current_seq_len(),
             Self::Shared { .. } => 0,
-            Self::Compressed { cache, layer, .. } => match cache.lock() {
-                Ok(guard) => guard.seq_len(*layer),
-                Err(e) => {
-                    error!("Compressed cache lock poisoned in current_seq_len: {e}");
-                    0
-                }
-            },
+            Self::Compressed { cache, layer, .. } => cache.seq_len(*layer),
         }
     }
 
@@ -255,14 +251,11 @@ impl KvCache {
                 v.reset();
             }
             Self::Shared { .. } => {}
-            Self::Compressed { cache, .. } => match cache.lock() {
-                Ok(mut guard) => {
-                    if let Err(e) = guard.reset() {
-                        error!("Compressed cache reset failed: {e}");
-                    }
+            Self::Compressed { cache, .. } => {
+                if let Err(e) = cache.reset() {
+                    error!("Compressed cache reset failed: {e}");
                 }
-                Err(e) => error!("Compressed cache lock poisoned in reset: {e}"),
-            },
+            }
         }
     }
 
@@ -516,7 +509,7 @@ impl NormalCache {
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
         let cfg =
             Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
-        let cache = turboquant::cache::PqoCache::new(cfg);
+        let cache = turboquant::cache::PqoCache::new(cfg)?;
         Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
 
@@ -538,7 +531,7 @@ impl NormalCache {
             norm_mode,
             usize::MAX,
         );
-        let pqo = turboquant::cache::PqoCache::new(cfg);
+        let pqo = turboquant::cache::PqoCache::new(cfg)?;
         Self::new_compressed_cache(pqo, num_layers, device, dtype)
     }
 
@@ -554,7 +547,7 @@ impl NormalCache {
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
         let cfg =
             Self::compressed_cache_config(bits, head_dim, num_kv_heads, num_layers, norm_mode, 0);
-        let cache = turboquant::cache::TqCache::new(cfg);
+        let cache = turboquant::cache::TqCache::new(cfg)?;
         Self::new_compressed_cache(cache, num_layers, device, dtype)
     }
 
@@ -583,8 +576,7 @@ impl NormalCache {
         device: candle_core::Device,
         dtype: candle_core::DType,
     ) -> candle_core::Result<Arc<Mutex<Self>>> {
-        let shared: Arc<std::sync::Mutex<dyn mistralrs_kv_cache::CompressedKVCache>> =
-            Arc::new(std::sync::Mutex::new(cache_impl));
+        let shared: Arc<dyn mistralrs_kv_cache::CompressedKVCache> = Arc::new(cache_impl);
         let mut caches = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
             caches.push(KvCache::new_compressed(
@@ -951,15 +943,8 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     ..
                 } => {
                     if !compressed_reset {
-                        match compressed_cache.lock() {
-                            Ok(mut guard) => {
-                                if let Err(e) = guard.reset() {
-                                    error!("Compressed cache reset failed in set_none_cache: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                error!("Compressed cache lock poisoned in set_none_cache: {e}")
-                            }
+                        if let Err(e) = compressed_cache.reset() {
+                            error!("Compressed cache reset failed in set_none_cache: {e}");
                         }
                         compressed_reset = true;
                     }

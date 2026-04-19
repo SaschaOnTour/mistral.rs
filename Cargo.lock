@@ -3612,9 +3612,9 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-kv-cache"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a81246b4728f64c9e75c35b64b66ba34315786a9da970dbacb011c6f852bde"
+checksum = "0e4afe80126de956c4ce8a7199943d14ab7bb34d283a0e2380ead923cecd51df"
 dependencies = [
  "candle-core",
 ]
@@ -6932,14 +6932,15 @@ dependencies = [
 
 [[package]]
 name = "turboquant-rs"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70b40b47dd129bd875499ffbc0b5a86872ca9a95e8d1d5323a41c67a87128ad6"
+checksum = "4f31293aead57ebd55e3fcb8b97ba525e40997d9385c845c265bbe4aec241163"
 dependencies = [
  "candle-core",
  "cudaforge",
  "half",
  "mistralrs-kv-cache",
+ "parking_lot",
  "serde",
  "thiserror 2.0.18",
 ]
